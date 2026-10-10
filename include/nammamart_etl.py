@@ -266,11 +266,29 @@ def run_etl(
     quarantine_dir: str | Path = DEFAULT_QUARANTINE_DIR,
     run_id: str | None = None,
     dag_id: str = "nammamart_etl_samy",
+    include_increment: bool = False,
 ) -> dict[str, Any]:
-    """Run the complete local ETL flow and return useful run metrics."""
+    """Run the ETL flow, optionally applying the next-day increment feed."""
 
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     data = load_source_data(data_dir)
+    increment_inserted = 0
+    increment_updated = 0
+    if include_increment:
+        # The increment contains corrections and new records. Keeping the
+        # latest row for each order_id implements an ETL upsert before quality
+        # checks, so corrected orders are not misclassified as duplicates.
+        original_order_ids = set(data["orders"]["order_id"].astype(str))
+        increment = data["orders_increment"].copy()
+        increment_ids = set(increment["order_id"].astype(str))
+        increment_updated = len(original_order_ids & increment_ids)
+        increment_inserted = len(increment_ids - original_order_ids)
+        data["orders"] = (
+            pd.concat([data["orders"], increment], ignore_index=True)
+            .drop_duplicates("order_id", keep="last")
+            .reset_index(drop=True)
+        )
+
     issues, dq_results = validate_data(data, run_id=run_id, dag_id=dag_id)
     quarantine_files = quarantine_critical_rows(data, issues, run_id=run_id, quarantine_dir=quarantine_dir)
     clean_tables = build_clean_tables(data, issues)
@@ -288,4 +306,6 @@ def run_etl(
         "warehouse_path": str(warehouse_path),
         "reconciliation_rows": len(reconciliation),
         "reports": reports,
+        "increment_inserted": increment_inserted,
+        "increment_updated": increment_updated,
     }

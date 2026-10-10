@@ -69,6 +69,41 @@ def load_raw_tables(
         con.close()
 
 
+def append_incremental_orders(
+    *,
+    data_dir: str | Path = DATA_DIR,
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+    run_id: str = "local-elt-increment",
+) -> dict[str, int]:
+    """Append the next-day order feed to raw storage without cleaning it."""
+
+    source_dir = Path(data_dir)
+    increment = pd.read_csv(
+        source_dir / SOURCE_FILES["orders_increment"],
+        dtype=str,
+        keep_default_na=False,
+    )
+    con = duckdb.connect(str(warehouse_path))
+    try:
+        existing_ids = set(
+            con.execute("SELECT DISTINCT order_id FROM raw_orders").fetchdf()["order_id"].astype(str)
+        )
+        increment_ids = set(increment["order_id"].astype(str))
+        increment["_loaded_at"] = datetime.now(timezone.utc).isoformat()
+        increment["_source_file"] = SOURCE_FILES["orders_increment"]
+        increment["_run_id"] = run_id
+        con.register("increment_frame", increment)
+        con.execute("INSERT INTO raw_orders SELECT * FROM increment_frame")
+        con.unregister("increment_frame")
+    finally:
+        con.close()
+    return {
+        "increment_rows_appended": len(increment),
+        "increment_inserted": len(increment_ids - existing_ids),
+        "increment_updated": len(increment_ids & existing_ids),
+    }
+
+
 def execute_sql_layers(*, warehouse_path: str | Path = DEFAULT_WAREHOUSE) -> None:
     """Run every staging and mart transformation from a checked-in SQL file."""
 
@@ -101,6 +136,36 @@ def run_elt(
             "passing_orders": con.execute("SELECT count(*) FROM stg_orders WHERE dq_status = 'PASS'").fetchone()[0],
             "mart_store_rows": con.execute("SELECT count(*) FROM mart_daily_store_kpis").fetchone()[0],
             "mart_category_rows": con.execute("SELECT count(*) FROM mart_category_margin").fetchone()[0],
+            "reconciliation_rows": con.execute("SELECT count(*) FROM mart_payment_reconciliation").fetchone()[0],
+        }
+    finally:
+        con.close()
+    return metrics
+
+
+def run_incremental_elt(
+    *,
+    data_dir: str | Path = DATA_DIR,
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+    run_id: str = "local-elt-increment",
+) -> dict[str, int | str]:
+    """Append the increment to raw and rebuild staging/marts with an upsert."""
+
+    increment_metrics = append_incremental_orders(
+        data_dir=data_dir,
+        warehouse_path=warehouse_path,
+        run_id=run_id,
+    )
+    execute_sql_layers(warehouse_path=warehouse_path)
+    con = duckdb.connect(str(warehouse_path), read_only=True)
+    try:
+        metrics: dict[str, int | str] = {
+            "warehouse_path": str(warehouse_path),
+            **increment_metrics,
+            "raw_orders": con.execute("SELECT count(*) FROM raw_orders").fetchone()[0],
+            "stg_orders": con.execute("SELECT count(*) FROM stg_orders").fetchone()[0],
+            "passing_orders": con.execute("SELECT count(*) FROM stg_orders WHERE dq_status = 'PASS'").fetchone()[0],
+            "mart_store_rows": con.execute("SELECT count(*) FROM mart_daily_store_kpis").fetchone()[0],
             "reconciliation_rows": con.execute("SELECT count(*) FROM mart_payment_reconciliation").fetchone()[0],
         }
     finally:

@@ -1,6 +1,15 @@
 -- Cast orders, standardise categorical values and calculate SQL quality flags.
 CREATE OR REPLACE TABLE stg_orders AS
-WITH typed AS (
+WITH latest_raw AS (
+    -- Raw is append-only. This latest-row rule is the SQL equivalent of a
+    -- MERGE on order_id: corrections overwrite the prior order version.
+    SELECT *
+    FROM raw_orders
+    QUALIFY row_number() OVER (
+        PARTITION BY order_id
+        ORDER BY try_cast(_loaded_at AS TIMESTAMP) DESC
+    ) = 1
+), typed AS (
     SELECT
         order_id,
         try_cast(order_ts AS TIMESTAMP) AS order_ts,
@@ -22,7 +31,7 @@ WITH typed AS (
         channel,
         try_cast(delivery_minutes AS INTEGER) AS delivery_minutes,
         count(*) OVER (PARTITION BY order_id) AS order_id_count
-    FROM raw_orders
+    FROM latest_raw
 ), checked AS (
     SELECT *, round(quantity * unit_price * (1 - discount_pct / 100), 2) AS expected_amount
     FROM typed
