@@ -138,3 +138,16 @@ Never commit API keys, Slack webhook URLs, passwords, other credentials, or unma
 The one-page CTO recommendation is [RECOMMENDATION_TO_CTO.md](./RECOMMENDATION_TO_CTO.md), and its validation notebook is [step13_recommendation_test.ipynb](./step13_recommendation_test.ipynb).
 
 The recommendation is to adopt **ELT as the primary warehouse architecture**, with a certified finance-facing contract that publishes only approved rows and metrics. It compares auditability, data-quality guarantees, rule-change effort, performance at 1,000× volume, cost, and operational risks using the observed NammaMart results. It ends with exactly three risks: incorrect `dq_status` filtering, warehouse cost/latency growth, and overexposure of raw PII.
+
+## Step 14 — final submission validation
+
+The validation notebook is [step14_final_submission_validation.ipynb](./step14_final_submission_validation.ipynb). It checks the final repository layout, parses both DAG files without importing Airflow, verifies both expected DAG IDs, and provides the exact Astro commands for final runtime validation:
+
+```text
+astro dev start
+astro dev run dags list-import-errors
+astro dev run dags test nammamart_etl_samy
+astro dev run dags test nammamart_elt_samy
+```
+
+The required final artifacts are present: both NammaMart DAGs, `include/sql/`, `include/data/nammamart/`, `include/quarantine/samy/`, `include/warehouse_samy.duckdb`, and this `SUBMISSION.md`. The notebook also records whether Astro is installed before attempting those commands.
