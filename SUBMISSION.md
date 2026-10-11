@@ -32,3 +32,18 @@ The notebook tests the same business-logic modules imported by the DAGs. Experim
 - **Schema:** missing required columns fail loudly; a formal contract is recommended.
 - **Distribution:** partially covered by amount consistency; store-level baselines are recommended.
 - **Lineage:** strongest because ETL quarantine and ELT raw tables preserve traceability.
+
+## Step 11 — business questions
+
+The executable notebook is [step11_business_questions_test.ipynb](./step11_business_questions_test.ipynb). The SQL query files are [business_questions_etl.sql](./include/sql/business_questions_etl.sql) and [business_questions_elt.sql](./include/sql/business_questions_elt.sql).
+
+The notebook answers these questions for both pipelines:
+
+1. Daily net revenue by zone and store.
+2. Revenue and gross margin by category.
+3. Average delivery time and percentage within 15 minutes.
+4. Revenue by payment mode and unreconciled amount.
+5. Top 10 customers by spend and loyalty tier.
+6. Rejected rows by file and failure reason.
+
+It also compares like-for-like September delivered net revenue. If totals differ, it lists the exact order IDs included by only one pipeline so the difference can be explained from data, rather than reported as an unexplained mismatch. Results are exported to `assignment/step11_business_questions/` when the notebook is run.
