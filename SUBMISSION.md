@@ -132,3 +132,9 @@ Finance needs both views: a current operational view reflecting the return and a
 ### Repository safety rules
 
 Never commit API keys, Slack webhook URLs, passwords, other credentials, or unmasked customer data outside the permitted input-data folder. The governance validation notebook is [step12_governance_documentation_test.ipynb](./step12_governance_documentation_test.ipynb); it checks this document, scans text/config files for secret-shaped values, and reports customer-data files outside the approved input paths.
+
+## Step 13 — recommendation
+
+The one-page CTO recommendation is [RECOMMENDATION_TO_CTO.md](./RECOMMENDATION_TO_CTO.md), and its validation notebook is [step13_recommendation_test.ipynb](./step13_recommendation_test.ipynb).
+
+The recommendation is to adopt **ELT as the primary warehouse architecture**, with a certified finance-facing contract that publishes only approved rows and metrics. It compares auditability, data-quality guarantees, rule-change effort, performance at 1,000× volume, cost, and operational risks using the observed NammaMart results. It ends with exactly three risks: incorrect `dq_status` filtering, warehouse cost/latency growth, and overexposure of raw PII.
