@@ -17,6 +17,7 @@ import pandas as pd
 
 from data_quality import run_quality_checks
 from masking import mask_email, mask_phone
+from observability import record_pipeline_run
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data" / "nammamart"
@@ -271,6 +272,7 @@ def run_etl(
     """Run the ETL flow, optionally applying the next-day increment feed."""
 
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    start_time = datetime.now(timezone.utc).isoformat()
     data = load_source_data(data_dir)
     increment_inserted = 0
     increment_updated = 0
@@ -295,6 +297,18 @@ def run_etl(
     reconciliation = build_payment_reconciliation(clean_tables, data["payments"])
     reports = build_reports(clean_tables["fact_orders"])
     write_warehouse(clean_tables, reconciliation, reports, dq_results, warehouse_path=warehouse_path)
+    end_time = datetime.now(timezone.utc).isoformat()
+    record_pipeline_run(
+        warehouse_path,
+        run_id=run_id,
+        dag_id=dag_id,
+        start_time=start_time,
+        end_time=end_time,
+        rows_extracted=sum(len(frame) for frame in data.values()),
+        rows_loaded=len(clean_tables["fact_orders"]),
+        rows_quarantined=len(issues[issues["severity"] == "Critical"]),
+        status="SUCCESS",
+    )
 
     return {
         "run_id": run_id,

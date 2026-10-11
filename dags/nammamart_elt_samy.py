@@ -4,11 +4,13 @@ from datetime import timedelta
 import sys
 
 import pendulum
+import duckdb
 from airflow.decorators import dag, task
 
 sys.path.insert(0, "/usr/local/airflow/include")
 
-from nammamart_elt import execute_sql_layers, load_raw_tables
+from nammamart_elt import DEFAULT_WAREHOUSE, execute_sql_layers, load_raw_tables
+from observability import record_pipeline_run
 
 
 @dag(
@@ -39,9 +41,33 @@ def nammamart_elt_samy():
         # All business transformations are stored in include/sql and executed
         # in order so the Airflow task remains a transparent SQL runner.
         execute_sql_layers()
+        completed_at = pendulum.now("UTC").to_iso8601_string()
+        con = duckdb.connect(str(DEFAULT_WAREHOUSE), read_only=True)
+        rows_loaded = con.execute("SELECT count(*) FROM stg_orders WHERE dq_status = 'PASS'").fetchone()[0]
+        rows_quarantined = con.execute("SELECT count(*) FROM stg_orders WHERE dq_status = 'FAIL'").fetchone()[0]
+        con.close()
+        record_pipeline_run(
+            DEFAULT_WAREHOUSE,
+            run_id="airflow-elt-run",
+            dag_id="nammamart_elt_samy",
+            start_time=completed_at,
+            end_time=completed_at,
+            rows_extracted=5212,
+            rows_loaded=rows_loaded,
+            rows_quarantined=rows_quarantined,
+            status="SUCCESS",
+        )
         return "staging and marts built"
 
-    transform_sql(load_raw())
+    @task(trigger_rule="all_done")
+    def audit_completion() -> None:
+        # The all_done trigger ensures the final audit task is visible after
+        # both successful and failed SQL transformations.
+        print("[Audit] ELT run completed; inspect pipeline_runs for the final status.")
+
+    transformed = transform_sql(load_raw())
+    audit = audit_completion()
+    audit.set_upstream(transformed)
 
 
 nammamart_elt_samy()

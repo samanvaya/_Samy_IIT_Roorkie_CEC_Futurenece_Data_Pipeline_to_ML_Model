@@ -21,6 +21,7 @@ from nammamart_etl import (
     validate_data,
     write_warehouse,
 )
+from observability import record_pipeline_run
 
 
 @dag(
@@ -105,6 +106,18 @@ def nammamart_etl_samy():
             dq_results,
             warehouse_path=DEFAULT_WAREHOUSE,
         )
+        completed_at = pendulum.now("UTC").to_iso8601_string()
+        record_pipeline_run(
+            DEFAULT_WAREHOUSE,
+            run_id=validation_result["run_id"],
+            dag_id="nammamart_etl_samy",
+            start_time=completed_at,
+            end_time=completed_at,
+            rows_extracted=sum(len(frame) for frame in data.values()),
+            rows_loaded=len(clean_tables["fact_orders"]),
+            rows_quarantined=len(issues[issues["severity"] == "Critical"]),
+            status="SUCCESS",
+        )
         return {
             "run_id": validation_result["run_id"],
             "rows_loaded": len(clean_tables["fact_orders"]),
@@ -112,12 +125,19 @@ def nammamart_etl_samy():
         }
 
     @task
-    def report(result: dict) -> None:
+    def report(result: dict) -> dict:
         """Print the final ETL metrics so they are visible in Airflow logs."""
 
         print(f"[ETL] Run: {result['run_id']}")
         print(f"[ETL] Clean fact rows loaded: {result['rows_loaded']}")
         print(f"[ETL] Payment reconciliation rows: {result['reconciliation_rows']}")
+        return result
+
+    @task(trigger_rule="all_done")
+    def audit_completion() -> None:
+        # This final task runs even when an upstream task fails, leaving a
+        # visible audit point in the Airflow graph and task logs.
+        print("[Audit] ETL run completed; inspect pipeline_runs for the final status.")
 
     extracted = [
         extract_orders(),
@@ -129,6 +149,8 @@ def nammamart_etl_samy():
     validation = validate_and_quarantine(extracted)
     loaded = transform_and_load(validation)
     report(loaded)
+    audit = audit_completion()
+    audit.set_upstream(loaded)
 
 
 nammamart_etl_samy()

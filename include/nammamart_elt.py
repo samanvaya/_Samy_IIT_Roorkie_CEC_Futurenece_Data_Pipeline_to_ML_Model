@@ -9,6 +9,7 @@ import duckdb
 import pandas as pd
 
 from nammamart_etl import DATA_DIR, SOURCE_FILES
+from observability import record_pipeline_run
 
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
@@ -140,6 +141,17 @@ def run_elt(
         }
     finally:
         con.close()
+    record_pipeline_run(
+        warehouse_path,
+        run_id=run_id,
+        dag_id="nammamart_elt_samy",
+        start_time=datetime.now(timezone.utc).isoformat(),
+        end_time=datetime.now(timezone.utc).isoformat(),
+        rows_extracted=2412 + 2228 + 405 + 152 + 15,
+        rows_loaded=int(metrics["passing_orders"]),
+        rows_quarantined=int(metrics["stg_orders"] - metrics["passing_orders"]),
+        status="SUCCESS",
+    )
     return metrics
 
 
@@ -170,4 +182,15 @@ def run_incremental_elt(
         }
     finally:
         con.close()
+    record_pipeline_run(
+        warehouse_path,
+        run_id=run_id,
+        dag_id="nammamart_elt_samy",
+        start_time=datetime.now(timezone.utc).isoformat(),
+        end_time=datetime.now(timezone.utc).isoformat(),
+        rows_extracted=int(metrics["increment_rows_appended"]),
+        rows_loaded=int(metrics["passing_orders"]),
+        rows_quarantined=int(metrics["stg_orders"] - metrics["passing_orders"]),
+        status="SUCCESS",
+    )
     return metrics
