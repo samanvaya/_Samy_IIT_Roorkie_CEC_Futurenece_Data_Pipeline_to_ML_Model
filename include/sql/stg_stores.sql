@@ -17,4 +17,5 @@ SELECT
         CASE WHEN try_cast(capacity_orders_per_day AS INTEGER) <= 0 THEN 'Store capacity is not positive' END
     ) AS failure_reason
 FROM raw_stores
-QUALIFY row_number() OVER (PARTITION BY store_id ORDER BY _loaded_at) = 1;
+-- rowid preserves CSV order, so the first source row wins exactly as in the ETL.
+QUALIFY row_number() OVER (PARTITION BY store_id ORDER BY _loaded_at, rowid) = 1;

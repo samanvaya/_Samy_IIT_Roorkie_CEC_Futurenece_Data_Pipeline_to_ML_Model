@@ -20,3 +20,6 @@ test_api.py
 assignment/quarantine_samy*/
 assignment/step11_business_questions/
 assignment/step12_governance_audit/
+
+# Restricted raw-PII warehouse files (unmasked customer contact data).
+*_pii.duckdb

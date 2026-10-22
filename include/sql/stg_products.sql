@@ -21,4 +21,5 @@ SELECT
         CASE WHEN try_cast(cost_price AS DECIMAL(12, 2)) > try_cast(mrp AS DECIMAL(12, 2)) THEN 'Cost price exceeds MRP' END
     ) AS failure_reason
 FROM raw_products
-QUALIFY row_number() OVER (PARTITION BY product_id ORDER BY _loaded_at) = 1;
+-- rowid preserves CSV order, so the first source row wins exactly as in the ETL.
+QUALIFY row_number() OVER (PARTITION BY product_id ORDER BY _loaded_at, rowid) = 1;

@@ -6,8 +6,7 @@ SELECT order_date, zone, store_id,
        SUM(net_revenue) AS daily_net_revenue,
        COUNT(*) AS delivered_orders
 FROM etl_fact_orders
-WHERE order_date >= '2026-09-01' AND order_date < '2026-10-01'
-  AND order_status = 'DELIVERED'
+WHERE order_status = 'DELIVERED'
 GROUP BY order_date, zone, store_id
 ORDER BY order_date, zone, store_id;
 
@@ -16,8 +15,7 @@ SELECT category,
        SUM(net_revenue) AS revenue,
        SUM(gross_margin) AS gross_margin
 FROM etl_fact_orders
-WHERE order_date >= '2026-09-01' AND order_date < '2026-10-01'
-  AND order_status = 'DELIVERED'
+WHERE order_status = 'DELIVERED'
 GROUP BY category
 ORDER BY revenue DESC;
 
@@ -27,8 +25,7 @@ SELECT store_id,
        100.0 * AVG(CASE WHEN delivery_minutes <= 15 THEN 1 ELSE 0 END) AS pct_within_15_min,
        COUNT(*) AS delivered_orders
 FROM etl_fact_orders
-WHERE order_date >= '2026-09-01' AND order_date < '2026-10-01'
-  AND order_status = 'DELIVERED'
+WHERE order_status = 'DELIVERED'
 GROUP BY store_id
 ORDER BY store_id;
 
@@ -36,15 +33,14 @@ ORDER BY store_id;
 WITH revenue AS (
     SELECT payment_mode, SUM(net_revenue) AS revenue
     FROM etl_fact_orders
-    WHERE order_date >= '2026-09-01' AND order_date < '2026-10-01'
+    WHERE order_status = 'DELIVERED'
     GROUP BY payment_mode
 ), mismatches AS (
-    SELECT f.payment_mode,
-           SUM(COALESCE(r.amount_paid, 0) - COALESCE(r.order_amount, 0)) AS unreconciled_amount,
+    SELECT COALESCE(order_payment_mode, payment_payment_mode) AS payment_mode,
+           SUM(COALESCE(amount_paid, 0) - COALESCE(order_amount, 0)) AS unreconciled_amount,
            COUNT(*) AS unreconciled_rows
-    FROM etl_payment_reconciliation r
-    LEFT JOIN etl_fact_orders f ON f.order_id = r.order_id
-    GROUP BY f.payment_mode
+    FROM etl_payment_reconciliation
+    GROUP BY COALESCE(order_payment_mode, payment_payment_mode)
 )
 SELECT COALESCE(revenue.payment_mode, mismatches.payment_mode) AS payment_mode,
        COALESCE(revenue.revenue, 0) AS revenue,
@@ -59,18 +55,19 @@ SELECT f.customer_id, c.full_name, c.loyalty_tier,
        SUM(f.net_revenue) AS total_spend
 FROM etl_fact_orders f
 JOIN etl_dim_customer c ON c.customer_id = f.customer_id
-WHERE f.order_date >= '2026-09-01' AND f.order_date < '2026-10-01'
-  AND f.order_status = 'DELIVERED'
+WHERE f.order_status = 'DELIVERED'
 GROUP BY f.customer_id, c.full_name, c.loyalty_tier
 ORDER BY total_spend DESC
 LIMIT 10;
 
 -- QUESTION: q6_rejected_rows
+-- Rows rejected by today's run: the latest scorecard in dq_results, one row
+-- per failed rule (a row that breaks two rules is counted under both).
 SELECT split_part(check_name, ':', 1) AS file_name,
        regexp_replace(check_name, '^[^:]+:[^:]+:', '') AS failure_reason,
        severity,
-       SUM(rows_failed) AS rejected_rows
+       rows_failed AS rejected_rows
 FROM dq_results
-WHERE status = 'FAIL'
-GROUP BY file_name, failure_reason, severity
+WHERE run_id = (SELECT run_id FROM dq_results ORDER BY checked_at DESC LIMIT 1)
+  AND rows_failed > 0
 ORDER BY file_name, rejected_rows DESC;

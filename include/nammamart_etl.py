@@ -15,9 +15,9 @@ from typing import Any
 import duckdb
 import pandas as pd
 
-from data_quality import run_quality_checks
+from data_quality import run_quality_checks, standardise_values
 from masking import mask_email, mask_phone
-from observability import record_pipeline_run
+from observability import append_dq_results, record_pipeline_run, volume_check
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data" / "nammamart"
@@ -44,6 +44,30 @@ def load_source_data(data_dir: str | Path = DATA_DIR) -> dict[str, pd.DataFrame]
         name: pd.read_csv(source_dir / filename)
         for name, filename in SOURCE_FILES.items()
     }
+
+
+def load_source_file(dataset_name: str, data_dir: str | Path = DATA_DIR) -> pd.DataFrame:
+    """Read one source file so each Airflow extract task fails independently."""
+
+    return pd.read_csv(Path(data_dir) / SOURCE_FILES[dataset_name])
+
+
+def apply_increment(data: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], int, int]:
+    """Upsert the next-day feed into ``orders``; return (data, inserted, updated).
+
+    Every base row whose order_id appears in the increment is replaced, so
+    corrected orders are not misclassified as duplicates. Duplicates *within*
+    orders.csv are left in place so the uniqueness check still quarantines
+    them, the same way stg_orders.sql only merges across loads.
+    """
+
+    original_order_ids = set(data["orders"]["order_id"].astype(str))
+    increment = data["orders_increment"].copy()
+    increment_ids = set(increment["order_id"].astype(str))
+    base = data["orders"][~data["orders"]["order_id"].astype(str).isin(increment_ids)]
+    merged = dict(data)
+    merged["orders"] = pd.concat([base, increment], ignore_index=True)
+    return merged, len(increment_ids - original_order_ids), len(original_order_ids & increment_ids)
 
 
 def _source_file_name(dataset_name: str) -> str:
@@ -110,6 +134,12 @@ def quarantine_critical_rows(
         file_reasons["_join_key"] = file_reasons["row_key"].astype(str)
         failed_rows = source.merge(file_reasons[["_join_key", "failure_reason"]], on="_join_key", how="inner")
         failed_rows = failed_rows.drop(columns=["_join_key"])
+        # Quarantine files are read by operations stewards, so contact details
+        # are masked; customer_id still traces each row back to the source.
+        if "email" in failed_rows.columns:
+            failed_rows["email"] = failed_rows["email"].map(mask_email)
+        if "phone" in failed_rows.columns:
+            failed_rows["phone"] = failed_rows["phone"].map(mask_phone)
         path = output_dir / f"{Path(file_name).stem}_failed_{run_id}.csv"
         failed_rows.to_csv(path, index=False)
         written_files.append(path)
@@ -117,10 +147,14 @@ def quarantine_critical_rows(
     return written_files
 
 
-def _critical_keys(issues: pd.DataFrame, file_name: str) -> set[str]:
+def _critical_keys(issues: pd.DataFrame, file_name: str, *, ignore_duplicates: bool = False) -> set[str]:
     """Return source keys that must not enter the clean reporting table."""
 
     selected = issues[(issues["file"] == file_name) & (issues["severity"] == "Critical")]
+    if ignore_duplicates:
+        # Duplicate dimension keys are resolved by keeping the first row, so
+        # the key itself stays valid; only its extra copies are quarantined.
+        selected = selected[~selected["problem"].str.startswith("Duplicate")]
     return set(selected["row_key"].astype(str))
 
 
@@ -130,8 +164,47 @@ def _remove_critical_rows(frame: pd.DataFrame, key: str, blocked_keys: set[str])
     return frame[~frame[key].astype(str).isin(blocked_keys)].copy()
 
 
+def add_dimension_failures(data: dict[str, pd.DataFrame], issues: pd.DataFrame) -> pd.DataFrame:
+    """Flag orders whose customer, product or store failed a Critical check.
+
+    These orders cannot join to a valid dimension row, so they are rejected.
+    Recording them as Critical order issues sends them to quarantine with a
+    reason instead of letting the star-schema inner join drop them silently
+    (the ELT equivalent is "Unknown or failed <key>" in stg_orders).
+    """
+
+    orders = data["orders"]
+    rows = []
+    for file_name, key in (("customers.csv", "customer_id"), ("products.csv", "product_id"), ("stores.csv", "store_id")):
+        blocked = _critical_keys(issues, file_name, ignore_duplicates=True)
+        for order_id in orders.loc[orders[key].astype(str).isin(blocked), "order_id"]:
+            rows.append({
+                "file": "orders.csv",
+                "row_key": order_id,
+                "column": key,
+                "problem": f"{key} failed quality checks in {file_name}",
+                "quality_dimension": "Consistency",
+                "proposed_rule": f"orders may only reference a {key} that passes its own checks",
+                "severity": "Critical",
+            })
+    if not rows:
+        return issues
+    return pd.concat([issues, pd.DataFrame(rows, columns=issues.columns)], ignore_index=True)
+
+
+def rejected_order_count(issues: pd.DataFrame) -> int:
+    """Distinct orders rejected by a Critical rule (same measure as ELT FAIL rows)."""
+
+    critical_orders = issues[(issues["file"] == "orders.csv") & (issues["severity"] == "Critical")]
+    return critical_orders["row_key"].astype(str).nunique()
+
+
 def build_clean_tables(data: dict[str, pd.DataFrame], issues: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Transform valid data into the ETL star-schema inputs."""
+
+    # Standardise casing/spelling first so the fact table carries the same
+    # values that the validator checked (``upi`` -> ``UPI``).
+    data = standardise_values(data)
 
     # Critical order failures are excluded from finance facts. Warning-level
     # PII format issues remain loadable and are protected during masking.
@@ -146,15 +219,16 @@ def build_clean_tables(data: dict[str, pd.DataFrame], issues: pd.DataFrame) -> d
     # Remove dimensions with critical completeness/accuracy issues before the
     # join; any order depending on them will fail the inner join and stay out
     # of the finance fact table.
-    customers = _remove_critical_rows(customers, "customer_id", _critical_keys(issues, "customers.csv"))
-    products = _remove_critical_rows(products, "product_id", _critical_keys(issues, "products.csv"))
-    stores = _remove_critical_rows(stores, "store_id", _critical_keys(issues, "stores.csv"))
+    customers = _remove_critical_rows(customers, "customer_id", _critical_keys(issues, "customers.csv", ignore_duplicates=True))
+    products = _remove_critical_rows(products, "product_id", _critical_keys(issues, "products.csv", ignore_duplicates=True))
+    stores = _remove_critical_rows(stores, "store_id", _critical_keys(issues, "stores.csv", ignore_duplicates=True))
 
     customers["email_masked"] = customers["email"].map(mask_email)
     customers["phone_masked"] = customers["phone"].map(mask_phone)
 
     # Inner joins enforce referential integrity in the final star schema.
-    fact = orders.merge(customers, on="customer_id", how="inner", suffixes=("", "_customer"))
+    # Raw email/phone stay out of the fact table; only masked values travel.
+    fact = orders.merge(customers.drop(columns=["email", "phone"]), on="customer_id", how="inner", suffixes=("", "_customer"))
     fact = fact.merge(products, on="product_id", how="inner", suffixes=("", "_product"))
     fact = fact.merge(stores, on="store_id", how="inner", suffixes=("", "_store"))
 
@@ -183,7 +257,9 @@ def build_payment_reconciliation(
     """Create one reconciliation row for every payment/order mismatch."""
 
     fact = clean_tables["fact_orders"]
+    payments = standardise_values({"payments": payments})["payments"]
     order_amounts = fact[["order_id", "order_amount", "payment_mode", "order_status"]].drop_duplicates("order_id")
+    payments = payments.drop(columns=["_payment_ts"], errors="ignore")
     joined = order_amounts.merge(payments, on="order_id", how="outer", indicator=True, suffixes=("_order", "_payment"))
     mismatch = joined[\
         (joined["_merge"] != "both")
@@ -193,17 +269,19 @@ def build_payment_reconciliation(
 
     def reason(row: pd.Series) -> str:
         if row["_merge"] == "left_only":
-            return "Missing payment for clean order"
+            return "Missing payment for order"
         if row["_merge"] == "right_only":
-            return "Payment references an order outside the clean fact table"
+            return "Payment references an order outside the clean orders"
         if row["payment_status"] == "SUCCESS" and abs(row["amount_paid"] - row["order_amount"]) > 0.01:
-            return "Successful payment amount does not match order amount"
-        return "Payment mode does not match order payment mode"
+            return "Successful payment amount mismatch"
+        return "Payment mode mismatch"
 
+    columns = ["order_id", "payment_id", "reason", "order_amount", "amount_paid", "order_payment_mode", "payment_payment_mode", "payment_status"]
     if mismatch.empty:
-        return pd.DataFrame(columns=["order_id", "payment_id", "reason", "order_amount", "amount_paid"])
+        return pd.DataFrame(columns=columns)
     mismatch["reason"] = mismatch.apply(reason, axis=1)
-    return mismatch[["order_id", "payment_id", "reason", "order_amount", "amount_paid"]]
+    mismatch =mismatch.rename(columns={"payment_mode_order": "order_payment_mode", "payment_mode_payment": "payment_payment_mode"})
+    return mismatch[columns]
 
 
 def build_reports(fact_orders: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -226,30 +304,13 @@ def build_reports(fact_orders: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
-def write_warehouse(
-    clean_tables: dict[str, pd.DataFrame],
-    reconciliation: pd.DataFrame,
-    reports: dict[str, pd.DataFrame],
-    dq_results: pd.DataFrame,
-    *,
-    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
-) -> None:
-    """Write the ETL outputs idempotently by replacing each derived table."""
+def write_tables(frames: dict[str, pd.DataFrame], *, warehouse_path: str | Path = DEFAULT_WAREHOUSE) -> None:
+    """Replace each named derived table; used by every ETL load step."""
 
     warehouse = Path(warehouse_path)
     warehouse.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(warehouse))
     try:
-        frames = {
-            "etl_fact_orders": clean_tables["fact_orders"],
-            "etl_dim_customer": clean_tables["dim_customer"],
-            "etl_dim_product": clean_tables["dim_product"],
-            "etl_dim_store": clean_tables["dim_store"],
-            "etl_payment_reconciliation": reconciliation,
-            "etl_daily_zone_revenue": reports["daily_zone_revenue"],
-            "etl_category_margin": reports["category_margin"],
-            "dq_results": dq_results,
-        }
         for table_name, frame in frames.items():
             # Replacing derived tables makes a rerun deterministic and avoids
             # double-counting revenue when the same source is processed twice.
@@ -258,6 +319,49 @@ def write_warehouse(
             con.unregister("current_frame")
     finally:
         con.close()
+
+
+def record_dq_results(
+    dq_results: pd.DataFrame,
+    *,
+    order_rows: int,
+    run_id: str,
+    dag_id: str,
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+) -> pd.DataFrame:
+    """Add the run-over-run volume check and append the run's scorecard."""
+
+    checked_at = str(dq_results["checked_at"].iloc[0]) if len(dq_results) else datetime.now(timezone.utc).isoformat()
+    volume = volume_check(warehouse_path, run_id=run_id, dag_id=dag_id, order_rows=order_rows, checked_at=checked_at)
+    scorecard = pd.concat([dq_results, volume], ignore_index=True)
+    append_dq_results(warehouse_path, scorecard)
+    return scorecard
+
+
+def write_warehouse(
+    clean_tables: dict[str, pd.DataFrame],
+    reconciliation: pd.DataFrame,
+    reports: dict[str, pd.DataFrame],
+    dq_results: pd.DataFrame,
+    *,
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+) -> None:
+    """Write the ETL outputs idempotently and append the run's scorecard."""
+
+    write_tables(
+        {
+            "etl_fact_orders": clean_tables["fact_orders"],
+            "etl_dim_customer": clean_tables["dim_customer"],
+            "etl_dim_product": clean_tables["dim_product"],
+            "etl_dim_store": clean_tables["dim_store"],
+            "etl_payment_reconciliation": reconciliation,
+            "etl_daily_zone_revenue": reports["daily_zone_revenue"],
+            "etl_category_margin": reports["category_margin"],
+        },
+        warehouse_path=warehouse_path,
+    )
+    # dq_results is appended (not replaced) so it is a scorecard over time.
+    append_dq_results(warehouse_path, dq_results)
 
 
 def run_etl(
@@ -274,28 +378,20 @@ def run_etl(
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     start_time = datetime.now(timezone.utc).isoformat()
     data = load_source_data(data_dir)
+    # Count only the files this run uses: the increment only when applied.
+    rows_extracted = sum(len(frame) for name, frame in data.items() if include_increment or name != "orders_increment")
     increment_inserted = 0
     increment_updated = 0
     if include_increment:
-        # The increment contains corrections and new records. Keeping the
-        # latest row for each order_id implements an ETL upsert before quality
-        # checks, so corrected orders are not misclassified as duplicates.
-        original_order_ids = set(data["orders"]["order_id"].astype(str))
-        increment = data["orders_increment"].copy()
-        increment_ids = set(increment["order_id"].astype(str))
-        increment_updated = len(original_order_ids & increment_ids)
-        increment_inserted = len(increment_ids - original_order_ids)
-        data["orders"] = (
-            pd.concat([data["orders"], increment], ignore_index=True)
-            .drop_duplicates("order_id", keep="last")
-            .reset_index(drop=True)
-        )
+        data, increment_inserted, increment_updated = apply_increment(data)
 
     issues, dq_results = validate_data(data, run_id=run_id, dag_id=dag_id)
+    issues = add_dimension_failures(data, issues)
     quarantine_files = quarantine_critical_rows(data, issues, run_id=run_id, quarantine_dir=quarantine_dir)
     clean_tables = build_clean_tables(data, issues)
     reconciliation = build_payment_reconciliation(clean_tables, data["payments"])
     reports = build_reports(clean_tables["fact_orders"])
+    dq_results = pd.concat([dq_results, volume_check(warehouse_path, run_id=run_id, dag_id=dag_id, order_rows=len(data["orders"]), checked_at=str(dq_results["checked_at"].iloc[0]))], ignore_index=True)
     write_warehouse(clean_tables, reconciliation, reports, dq_results, warehouse_path=warehouse_path)
     end_time = datetime.now(timezone.utc).isoformat()
     record_pipeline_run(
@@ -304,17 +400,17 @@ def run_etl(
         dag_id=dag_id,
         start_time=start_time,
         end_time=end_time,
-        rows_extracted=sum(len(frame) for frame in data.values()),
+        rows_extracted=rows_extracted,
         rows_loaded=len(clean_tables["fact_orders"]),
-        rows_quarantined=len(issues[issues["severity"] == "Critical"]),
+        rows_quarantined=rejected_order_count(issues),
         status="SUCCESS",
     )
 
     return {
         "run_id": run_id,
-        "rows_extracted": sum(len(frame) for frame in data.values()),
+        "rows_extracted": rows_extracted,
         "rows_loaded": len(clean_tables["fact_orders"]),
-        "rows_quarantined": len(issues[issues["severity"] == "Critical"]),
+        "rows_quarantined": rejected_order_count(issues),
         "issue_rows": len(issues),
         "quarantine_files": [str(path) for path in quarantine_files],
         "warehouse_path": str(warehouse_path),

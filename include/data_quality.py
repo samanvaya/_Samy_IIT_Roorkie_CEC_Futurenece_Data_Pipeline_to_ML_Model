@@ -21,6 +21,15 @@ import pandas as pd
 
 VALID_ORDER_STATUSES = {"DELIVERED", "CANCELLED", "RETURNED"}
 VALID_PAYMENT_MODES = {"UPI", "Card", "Cash on Delivery", "Wallet"}
+VALID_LOYALTY_TIERS = {"Bronze", "Silver", "Gold", "Platinum"}
+
+# The latest source export (orders_2026-10-01_increment.csv) was produced on
+# 1 October 2026, so no order can be dated after the end of that day. Pinning
+# the cut-off keeps results reproducible: comparing with "now" would let a
+# planted future order (ORD001693, dated 21 Oct 2026) pass once that date is
+# reached. In production this is the Airflow run's data_interval_end.
+DATA_AS_OF = pd.Timestamp("2026-10-02 00:00:00")
+FRESHNESS_LIMIT = pd.Timedelta(days=1)
 
 ISSUE_COLUMNS = [
     "file",
@@ -43,6 +52,49 @@ DQ_COLUMNS = [
     "status",
     "checked_at",
 ]
+
+
+PAYMENT_MODE_MAP = {
+    "upi": "UPI",
+    "card": "Card",
+    "cod": "Cash on Delivery",
+    "cashh": "Cash on Delivery",
+    "cash on delivery": "Cash on Delivery",
+    "wallet": "Wallet",
+}
+
+
+def standardise_payment_mode(values: pd.Series) -> pd.Series:
+    """Trim and map payment-mode spellings exactly like the ELT staging SQL."""
+
+    trimmed = values.astype("string").str.strip()
+    return trimmed.str.lower().map(PAYMENT_MODE_MAP).fillna(trimmed)
+
+
+def standardise_values(data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Return copies with trimmed/cased categorical values (``upi`` -> ``UPI``).
+
+    Validation runs on the standardised values so a casing problem is fixed
+    rather than quarantined, matching ``stg_orders.sql`` and ``stg_payments.sql``.
+    """
+
+    result = dict(data)
+    for name in ("orders", "orders_increment"):
+        if name in result:
+            frame = result[name].copy()
+            frame["payment_mode"] = standardise_payment_mode(frame["payment_mode"])
+            frame["order_status"] = frame["order_status"].astype("string").str.strip().str.upper()
+            result[name] = frame
+    if "customers" in result:
+        frame = result["customers"].copy()
+        frame["loyalty_tier"] = frame["loyalty_tier"].astype("string").str.strip().str.title()
+        result["customers"] = frame
+    if "payments" in result:
+        frame = result["payments"].copy()
+        frame["payment_mode"] = standardise_payment_mode(frame["payment_mode"])
+        frame["payment_status"] = frame["payment_status"].astype("string").str.strip().str.upper()
+        result["payments"] = frame
+    return result
 
 
 def _safe_mask(mask: Any, index: pd.Index) -> pd.Series:
@@ -163,6 +215,10 @@ def run_quality_checks(
     checked_at = checked_at or datetime.now(timezone.utc).isoformat()
     issues: list[dict[str, Any]] = []
     checks: list[dict[str, Any]] = []
+    # Casing is checked on the values as received; everything else is checked
+    # after standardisation so a casing problem is logged, not quarantined.
+    raw_customers = data["customers"].copy()
+    data = standardise_values(data)
 
     orders = data["orders"].copy()
     customers = data["customers"].copy()
@@ -188,10 +244,19 @@ def run_quality_checks(
     _check(frame=orders, file_name="orders.csv", row_key="order_id", column="order_amount", mask=(orders["order_amount"] - expected_amount).abs() > 0.01, problem="Amount does not match pricing formula", dimension="Accuracy", proposed_rule="order_amount must equal quantity × unit_price × discount", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=orders, file_name="orders.csv", row_key="order_id", column="delivery_minutes", mask=(orders["order_status"] == "DELIVERED") & orders["delivery_minutes"].isna(), problem="Delivered order has no delivery time", dimension="Completeness", proposed_rule="DELIVERED orders require delivery_minutes", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=orders, file_name="orders.csv", row_key="order_id", column="delivery_minutes", mask=orders["delivery_minutes"].fillna(0) > 120, problem="Delivery time exceeds 120 minutes", dimension="Accuracy", proposed_rule="delivery_minutes should be at most 120", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
-    _check(frame=orders, file_name="orders.csv", row_key="order_id", column="order_ts", mask=orders["_order_ts"] > pd.Timestamp.now(), problem="Future-dated order", dimension="Timeliness", proposed_rule="order_ts must not be in the future", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+    _check(frame=orders, file_name="orders.csv", row_key="order_id", column="discount_pct", mask=~orders["discount_pct"].between(0, 100), problem="Discount outside 0-100", dimension="Validity", proposed_rule="discount_pct must be between 0 and 100", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+    _check(frame=orders, file_name="orders.csv", row_key="order_id", column="order_ts", mask=orders["_order_ts"].isna(), problem="order_ts is not a valid timestamp", dimension="Validity", proposed_rule="order_ts must parse as a timestamp", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+    _check(frame=orders, file_name="orders.csv", row_key="order_id", column="order_ts", mask=orders["_order_ts"] > min(pd.Timestamp.now(), DATA_AS_OF), problem="Future-dated order", dimension="Timeliness", proposed_rule="order_ts must not be later than the source export (2026-10-01)", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=orders, file_name="orders.csv", row_key="order_id", column="customer_id", mask=~orders["customer_id"].isin(set(customers["customer_id"])), problem="Unknown customer_id", dimension="Consistency", proposed_rule="orders.customer_id must exist in customers", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=orders, file_name="orders.csv", row_key="order_id", column="product_id", mask=~orders["product_id"].isin(set(products["product_id"])), problem="Unknown product_id", dimension="Consistency", proposed_rule="orders.product_id must exist in products", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=orders, file_name="orders.csv", row_key="order_id", column="store_id", mask=~orders["store_id"].isin(set(stores["store_id"])), problem="Unknown store_id", dimension="Consistency", proposed_rule="orders.store_id must exist in stores", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+
+    # Dataset-level freshness: one Warning row in the scorecard (no row is
+    # quarantined) when the newest order is more than a day old at run time.
+    cutoff = min(pd.Timestamp.now(), DATA_AS_OF)
+    latest_order = orders.loc[orders["_order_ts"] <= cutoff, "_order_ts"].max()
+    stale = pd.isna(latest_order) or pd.Timestamp.now() - latest_order > FRESHNESS_LIMIT
+    _record_check(checks, run_id=run_id, dag_id=dag_id, check_name="orders.csv:order_ts:Latest order older than 1 day", dimension="Timeliness", severity="Warning", rows_checked=len(orders), rows_failed=int(stale), checked_at=checked_at)
 
     # ----------------------------- Payments --------------------------------
     _check(frame=payments, file_name="payments.csv", row_key="payment_id", column="payment_id", mask=payments["payment_id"].duplicated(keep=False), problem="Duplicate payment_id", dimension="Uniqueness", proposed_rule="payment_id must be unique", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
@@ -206,6 +271,8 @@ def run_quality_checks(
     _check(frame=customers, file_name="customers.csv", row_key="customer_id", column="customer_id", mask=customers["customer_id"].duplicated(keep=False), problem="Duplicate customer_id", dimension="Uniqueness", proposed_rule="customer_id must be unique", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=customers, file_name="customers.csv", row_key="customer_id", column="email", mask=~customers["email"].fillna("").str.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"), problem="Invalid email format", dimension="Validity", proposed_rule="email should follow a valid email format", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=customers, file_name="customers.csv", row_key="customer_id", column="phone", mask=~customers["phone"].fillna("").astype(str).str.fullmatch(r"\d{10}"), problem="Phone is not a 10-digit number", dimension="Validity", proposed_rule="phone should contain exactly 10 digits", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+    _check(frame=raw_customers, file_name="customers.csv", row_key="customer_id", column="loyalty_tier", mask=~raw_customers["loyalty_tier"].isin(VALID_LOYALTY_TIERS), problem="Loyalty tier casing is not standard", dimension="Consistency", proposed_rule="loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+    _check(frame=customers, file_name="customers.csv", row_key="customer_id", column="signup_date", mask=customers["_signup_date"] > min(pd.Timestamp.now(), DATA_AS_OF), problem="Future signup_date", dimension="Timeliness", proposed_rule="signup_date must not be later than the source export", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=customers, file_name="customers.csv", row_key="customer_id", column="pincode", mask=~customers["pincode"].fillna("").astype(str).str.fullmatch(r"\d{6}"), problem="Pincode is not six digits", dimension="Validity", proposed_rule="pincode should contain exactly 6 digits", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
 
     # ------------------------------ Products --------------------------------

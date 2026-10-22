@@ -13,10 +13,12 @@ import shutil
 import tempfile
 from typing import Callable, Iterator
 
+import duckdb
 import pandas as pd
 
 from nammamart_etl import DATA_DIR, run_etl
 from nammamart_elt import run_elt, run_incremental_elt
+from observability import VOLUME_CHECK_NAME
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -75,8 +77,34 @@ def _capture(function: Callable[[], object]) -> tuple[object | None, str | None]
 
     try:
         return function(), None
+    except FileNotFoundError as error:
+        return None, f"FileNotFoundError: {Path(error.filename).name} not found"
     except Exception as error:  # noqa: BLE001 - experiments must record failures.
         return None, f"{type(error).__name__}: {error}"
+
+
+def _latest_check(warehouse: Path, check_name: str) -> str:
+    """Read one check from the latest dq_results run, e.g. ``FAIL (1/50)``."""
+
+    con = duckdb.connect(str(warehouse), read_only=True)
+    try:
+        row = con.execute(
+            "SELECT status, rows_failed, rows_checked FROM dq_results WHERE check_name = ? ORDER BY checked_at DESC LIMIT 1",
+            [check_name],
+        ).fetchone()
+    finally:
+        con.close()
+    return "not recorded" if row is None else f"{row[0]} (failed={row[1]}, checked={row[2]})"
+
+
+def _summary(result: dict, keys: tuple[str, ...]) -> str:
+    """Compact ``key=value`` text for the report instead of a full dict."""
+
+    return ", ".join(f"{key}={result[key]}" for key in keys if key in result)
+
+
+ETL_KEYS = ("rows_extracted", "rows_loaded", "rows_quarantined", "reconciliation_rows")
+ELT_KEYS = ("raw_orders", "stg_orders", "passing_orders", "reconciliation_rows")
 
 
 def _normal_run(work_dir: Path) -> list[dict[str, str | int]]:
@@ -85,8 +113,8 @@ def _normal_run(work_dir: Path) -> list[dict[str, str | int]]:
         elt, elt_error = _capture(lambda: _run_elt(source, work_dir, "exp01"))
         expected = "Both DAG implementations complete and publish observable row counts."
         return [
-            _result(1, "ETL", expected, str(etl if etl_error is None else etl_error), "Keep the happy-path audit and row-count checks."),
-            _result(1, "ELT", expected, str(elt if elt_error is None else elt_error), "Keep the happy-path audit and row-count checks."),
+            _result(1, "ETL", expected, etl_error or _summary(etl, ETL_KEYS), "Keep the happy-path audit and row-count checks."),
+            _result(1, "ELT", expected, elt_error or _summary(elt, ELT_KEYS), "Keep the happy-path audit and row-count checks."),
         ]
 
 
@@ -154,10 +182,20 @@ def _invalid_data(work_dir: Path) -> list[dict[str, str | int]]:
         _write_five_invalid_rows(source)
         etl = _run_etl(source, work_dir, "exp05")
         elt = _run_elt(source, work_dir, "exp05")
-        expected = "The five added rows are rejected or marked FAIL with the matching reasons."
+        injected = [f"STEP10-{suffix}" for suffix in ("NULL_CUSTOMER", "NEGATIVE_QTY", "UNKNOWN_STORE", "BAD_STATUS", "FUTURE_DATE")]
+        quarantine = pd.read_csv(work_dir / "exp05_etl_quarantine" / "orders_failed_step10-exp05-etl.csv")
+        etl_reasons = quarantine.set_index("order_id")["failure_reason"].to_dict()
+        con = duckdb.connect(str(work_dir / "exp05_elt.duckdb"), read_only=True)
+        try:
+            elt_reasons = dict(con.execute(
+                f"SELECT order_id, failure_reason FROM stg_orders WHERE order_id IN ({', '.join(repr(i) for i in injected)})"
+            ).fetchall())
+        finally:
+            con.close()
+        expected = "Each of the five added rows is rejected with the matching reason and dq_results counts it."
         return [
-            _result(5, "ETL", expected, f"quarantined={etl['rows_quarantined']}, issue_rows={etl['issue_rows']}", "Keep row-level reasons and add assertions for every injected defect."),
-            _result(5, "ELT", expected, f"passing_staging={elt['passing_orders']}, failed_staging={elt['stg_orders'] - elt['passing_orders']}", "Expose failure_reason and dq_status in the staging audit query."),
+            _result(5, "ETL", expected, "; ".join(f"{i}: {etl_reasons.get(i, 'NOT QUARANTINED')}" for i in injected) + f" | rejected orders={etl['rows_quarantined']}", "Keep row-level reasons; add an automated assertion per injected defect."),
+            _result(5, "ELT", expected, "; ".join(f"{i}: {elt_reasons.get(i, 'NOT FOUND')}" for i in injected) + f" | failed staging rows={elt['stg_orders'] - elt['passing_orders']}", "Keep dq_status/failure_reason in staging; add the same per-defect assertion."),
         ]
 
 
@@ -176,15 +214,17 @@ def _schema_change(work_dir: Path) -> list[dict[str, str | int]]:
 
 def _volume_anomaly(work_dir: Path) -> list[dict[str, str | int]]:
     with isolated_source_copy() as source:
+        # A full run first gives the run-over-run volume check its baseline.
+        _run_etl(source, work_dir, "exp07")
+        _run_elt(source, work_dir, "exp07")
         orders = pd.read_csv(source / "orders.csv").head(50)
         orders.to_csv(source / "orders.csv", index=False)
-        etl = _run_etl(source, work_dir, "exp07")
-        elt = _run_elt(source, work_dir, "exp07")
+        etl = run_etl(data_dir=source, warehouse_path=work_dir / "exp07_etl.duckdb", quarantine_dir=work_dir / "exp07_etl_quarantine", run_id="step10-exp07-etl-small")
+        elt = run_elt(data_dir=source, warehouse_path=work_dir / "exp07_elt.duckdb", run_id="step10-exp07-elt-small")
         expected = "A greater-than-90% volume drop is detected and reported."
-        observed = "Pipeline completed; current implementation has no explicit volume threshold check."
         return [
-            _result(7, "ETL", expected, f"{observed} loaded={etl['rows_loaded']}", "Add a run-over-run volume check to dq_results and alert when volume drops below 10%."),
-            _result(7, "ELT", expected, f"{observed} passing_staging={elt['passing_orders']}", "Add a SQL volume check and persist it in the observability scorecard."),
+            _result(7, "ETL", expected, f"volume check {_latest_check(work_dir / 'exp07_etl.duckdb', VOLUME_CHECK_NAME)}; loaded={etl['rows_loaded']}", "Alert (Slack) when the volume check fails instead of only logging it."),
+            _result(7, "ELT", expected, f"volume check {_latest_check(work_dir / 'exp07_elt.duckdb', VOLUME_CHECK_NAME)}; passing_staging={elt['passing_orders']}", "Alert (Slack) when the volume check fails instead of only logging it."),
         ]
 
 
@@ -207,15 +247,15 @@ def _distribution_drift(work_dir: Path) -> list[dict[str, str | int]]:
 def _stale_data(work_dir: Path) -> list[dict[str, str | int]]:
     with isolated_source_copy() as source:
         orders = pd.read_csv(source / "orders.csv")
-        orders["order_ts"] = (pd.Timestamp.utcnow() - pd.Timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        orders["order_ts"] = (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
         orders.to_csv(source / "orders.csv", index=False)
         etl = _run_etl(source, work_dir, "exp09")
         elt = _run_elt(source, work_dir, "exp09")
         expected = "A timeliness check warns that the latest order is 30 days old."
-        observed = "Pipeline completes; current implementation checks future dates but does not check stale latest-order age."
+        check = "orders.csv:order_ts:Latest order older than 1 day"
         return [
-            _result(9, "ETL", expected, f"{observed} loaded={etl['rows_loaded']}", "Add a latest-order freshness warning to dq_results."),
-            _result(9, "ELT", expected, f"{observed} passing_staging={elt['passing_orders']}", "Add a SQL freshness query and alert when the latest order is older than one day."),
+            _result(9, "ETL", expected, f"freshness check {_latest_check(work_dir / 'exp09_etl.duckdb', check)}; loaded={etl['rows_loaded']}", "Alert when the freshness Warning fires on a scheduled run."),
+            _result(9, "ELT", expected, f"freshness check {_latest_check(work_dir / 'exp09_elt.duckdb', check)}; passing_staging={elt['passing_orders']}", "Alert when the freshness Warning fires on a scheduled run."),
         ]
 
 
@@ -230,8 +270,8 @@ def _recovery(work_dir: Path) -> list[dict[str, str | int]]:
         etl_success, etl_error = _capture(lambda: _run_etl(source, work_dir, "exp10-recovered"))
         elt_success, elt_error = _capture(lambda: _run_elt(source, work_dir, "exp10-recovered"))
         return [
-            _result(10, "ETL", "After fixing the source, clearing the failed task reruns it and downstream tasks successfully.", f"failure={etl_failure}; recovery={etl_success or etl_error}", "In Airflow, use Clear on the failed extract and downstream tasks; keep the audit row for the failed attempt."),
-            _result(10, "ELT", "After fixing the source, clearing the failed load/transform path reruns successfully.", f"failure={elt_failure}; recovery={elt_success or elt_error}", "In Airflow, clear only the failed task and its downstream dependants, then verify pipeline_runs."),
+            _result(10, "ETL", "After fixing the source, clearing the failed task reruns it and downstream tasks successfully.", f"failure={etl_failure}; recovery={etl_error or _summary(etl_success, ETL_KEYS)}", "In Airflow, use Clear on the failed extract and downstream tasks; keep the audit row for the failed attempt."),
+            _result(10, "ELT", "After fixing the source, clearing the failed load/transform path reruns successfully.", f"failure={elt_failure}; recovery={elt_error or _summary(elt_success, ELT_KEYS)}", "In Airflow, clear only the failed task and its downstream dependants, then verify pipeline_runs."),
         ]
 
 
@@ -259,8 +299,8 @@ def write_report(report: pd.DataFrame, output_dir: str | Path = REPO_ROOT / "ass
         "The report was generated using isolated temporary source copies. Original files were not modified.\n\n"
         + report.to_markdown(index=False)
         + "\n\n## Observability pillars\n\n"
-        "- Freshness: currently weakest; add a latest-order-age check.\n"
-        "- Volume: currently weakest alongside freshness; add a run-over-run threshold.\n"
+        "- Freshness: covered by the latest-order-age Warning in dq_results; no alert is sent yet.\n"
+        "- Volume: covered by the run-over-run >90% drop check in dq_results; no alert is sent yet.\n"
         "- Schema: covered by loud missing-column failures; add a formal contract.\n"
         "- Distribution: partially covered by amount consistency; add baselines by store.\n"
         "- Lineage: strongest because ETL quarantine and ELT raw tables preserve traceability.\n"

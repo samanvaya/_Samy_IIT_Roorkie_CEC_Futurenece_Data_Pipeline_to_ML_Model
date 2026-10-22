@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import duckdb
 import pandas as pd
 
 from nammamart_etl import DATA_DIR, SOURCE_FILES
-from observability import record_pipeline_run
+from observability import append_dq_results, record_pipeline_run, volume_check
 
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
@@ -31,6 +32,27 @@ STAGING_SQL_FILES = [
     "stg_payments.sql",
 ]
 
+# Raw tables holding unmasked personal data. They are written to a separate
+# owner-only DuckDB file so the shared warehouse never contains raw PII;
+# only the staging step attaches it, as ``pii``, to build masked columns.
+PII_RAW_TABLES = {"raw_customers"}
+PII_ALIAS = "pii"
+
+
+def pii_warehouse_path(warehouse_path: str | Path) -> Path:
+    """Return the restricted raw-PII file that sits next to a warehouse."""
+
+    warehouse = Path(warehouse_path)
+    return warehouse.with_name(f"{warehouse.stem}_pii{warehouse.suffix}")
+
+
+def _restrict_permissions(path: Path) -> None:
+    """Limit the raw-PII file to its owner (the Airflow service user)."""
+
+    if path.exists():
+        os.chmod(path, 0o600)
+
+
 MART_SQL_FILES = [
     "mart_daily_store_kpis.sql",
     "mart_category_margin.sql",
@@ -49,7 +71,9 @@ def load_raw_tables(
     """Load the five base files as text, adding only ingestion metadata."""
 
     source_dir = Path(data_dir)
+    pii_path = pii_warehouse_path(warehouse_path)
     con = duckdb.connect(str(warehouse_path))
+    pii_con = duckdb.connect(str(pii_path))
     loaded_at = datetime.now(timezone.utc).isoformat()
     try:
         for dataset_name, table_name in RAW_TABLES.items():
@@ -63,11 +87,17 @@ def load_raw_tables(
             frame["_loaded_at"] = loaded_at
             frame["_source_file"] = SOURCE_FILES[dataset_name]
             frame["_run_id"] = run_id
-            con.register("raw_frame", frame)
-            con.execute(f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM raw_frame')
-            con.unregister("raw_frame")
+            target = pii_con if table_name in PII_RAW_TABLES else con
+            target.register("raw_frame", frame)
+            target.execute(f'CREATE OR REPLACE TABLE "{table_name}" AS SELECT * FROM raw_frame')
+            target.unregister("raw_frame")
+        for table_name in PII_RAW_TABLES:
+            # Remove copies left in the shared warehouse by earlier versions.
+            con.execute(f'DROP TABLE IF EXISTS "{table_name}"')
     finally:
         con.close()
+        pii_con.close()
+    _restrict_permissions(pii_path)
 
 
 def append_incremental_orders(
@@ -105,17 +135,87 @@ def append_incremental_orders(
     }
 
 
-def execute_sql_layers(*, warehouse_path: str | Path = DEFAULT_WAREHOUSE) -> None:
-    """Run every staging and mart transformation from a checked-in SQL file."""
+DQ_CHECKS_SQL_FILE = "dq_checks_elt.sql"
+
+
+def _connect_with_pii(warehouse_path: str | Path) -> duckdb.DuckDBPyConnection:
+    """Open the warehouse with the raw-PII file attached read-only as ``pii``."""
 
     con = duckdb.connect(str(warehouse_path))
+    # Raw PII is attached only while SQL runs; staging and marts persist
+    # masked columns in the shared warehouse.
+    con.execute(f"ATTACH '{pii_warehouse_path(warehouse_path)}' AS {PII_ALIAS} (READ_ONLY)")
+    return con
+
+
+def run_sql_files(filenames: list[str], *, warehouse_path: str | Path = DEFAULT_WAREHOUSE) -> None:
+    """Execute checked-in SQL files in order (one Airflow task per layer)."""
+
+    con = _connect_with_pii(warehouse_path)
     try:
-        # SQL files are executed in a fixed order so marts always see fully
-        # created staging tables and are reproducible across reruns.
-        for filename in STAGING_SQL_FILES + MART_SQL_FILES:
+        for filename in filenames:
             con.execute((SQL_DIR / filename).read_text())
     finally:
         con.close()
+
+
+def execute_sql_layers(*, warehouse_path: str | Path = DEFAULT_WAREHOUSE) -> None:
+    """Run every staging and mart transformation from a checked-in SQL file."""
+
+    # Staging runs first so marts always see fully created staging tables.
+    run_sql_files(STAGING_SQL_FILES, warehouse_path=warehouse_path)
+    run_sql_files(MART_SQL_FILES, warehouse_path=warehouse_path)
+
+
+def record_dq_results(
+    *,
+    run_id: str,
+    dag_id: str = "nammamart_elt_samy",
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+) -> pd.DataFrame:
+    """Run the SQL scorecard and append it, with the volume check, to dq_results."""
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    con = _connect_with_pii(warehouse_path)
+    try:
+        checks = con.execute((SQL_DIR / DQ_CHECKS_SQL_FILE).read_text()).fetchdf()
+    finally:
+        con.close()
+    checks.insert(0, "dag_id", dag_id)
+    checks.insert(0, "run_id", run_id)
+    checks["status"] = checks["rows_failed"].map(lambda failed: "PASS" if failed == 0 else "FAIL")
+    checks["checked_at"] = checked_at
+    current_orders = _count_current_orders(warehouse_path)
+    volume = volume_check(warehouse_path, run_id=run_id, dag_id=dag_id, order_rows=current_orders, checked_at=checked_at)
+    scorecard = pd.concat([checks, volume], ignore_index=True)
+    append_dq_results(warehouse_path, scorecard)
+    return scorecard
+
+
+def _count_current_orders(warehouse_path: str | Path) -> int:
+    """Rows in the latest load of each order_id (the rows the checks cover)."""
+
+    con = duckdb.connect(str(warehouse_path), read_only=True)
+    try:
+        return con.execute(
+            "SELECT count(*) FROM (SELECT 1 FROM raw_orders QUALIFY _loaded_at = max(_loaded_at) OVER (PARTITION BY order_id))"
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+
+def count_raw_rows(warehouse_path: str | Path = DEFAULT_WAREHOUSE) -> int:
+    """Total raw rows across the five base tables, including restricted PII."""
+
+    total = 0
+    for table_name in RAW_TABLES.values():
+        path = pii_warehouse_path(warehouse_path) if table_name in PII_RAW_TABLES else warehouse_path
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            total += con.execute(f'SELECT count(*) FROM "{table_name}"').fetchone()[0]
+        finally:
+            con.close()
+    return total
 
 
 def run_elt(
@@ -128,6 +228,7 @@ def run_elt(
 
     load_raw_tables(data_dir=data_dir, warehouse_path=warehouse_path, run_id=run_id)
     execute_sql_layers(warehouse_path=warehouse_path)
+    record_dq_results(run_id=run_id, warehouse_path=warehouse_path)
     con = duckdb.connect(str(warehouse_path), read_only=True)
     try:
         metrics = {
@@ -147,7 +248,7 @@ def run_elt(
         dag_id="nammamart_elt_samy",
         start_time=datetime.now(timezone.utc).isoformat(),
         end_time=datetime.now(timezone.utc).isoformat(),
-        rows_extracted=2412 + 2228 + 405 + 152 + 15,
+        rows_extracted=count_raw_rows(warehouse_path),
         rows_loaded=int(metrics["passing_orders"]),
         rows_quarantined=int(metrics["stg_orders"] - metrics["passing_orders"]),
         status="SUCCESS",
@@ -169,6 +270,7 @@ def run_incremental_elt(
         run_id=run_id,
     )
     execute_sql_layers(warehouse_path=warehouse_path)
+    record_dq_results(run_id=run_id, warehouse_path=warehouse_path)
     con = duckdb.connect(str(warehouse_path), read_only=True)
     try:
         metrics: dict[str, int | str] = {

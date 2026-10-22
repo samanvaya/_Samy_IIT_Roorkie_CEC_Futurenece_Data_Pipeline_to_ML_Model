@@ -99,8 +99,6 @@ orders.csv,ORD001104,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy
 orders.csv,ORD000020,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy,delivery_minutes should be at most 120,Critical
 orders.csv,ORD000424,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy,delivery_minutes should be at most 120,Critical
 orders.csv,ORD002119,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001693,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001089,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
 orders.csv,ORD001121,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
 orders.csv,ORD001765,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
 orders.csv,ORD001965,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical

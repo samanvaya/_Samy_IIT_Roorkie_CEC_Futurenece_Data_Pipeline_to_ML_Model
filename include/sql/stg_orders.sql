@@ -3,7 +3,9 @@ CREATE OR REPLACE TABLE stg_orders AS
 WITH latest_raw AS (
     -- Raw is append-only. This latest-row rule is the SQL equivalent of a
     -- MERGE on order_id: corrections overwrite the prior order version.
-    SELECT *
+    -- Duplicates are counted within one load (before QUALIFY removes them),
+    -- so a repeated order_id inside a single file still fails uniqueness.
+    SELECT *, count(*) OVER (PARTITION BY order_id, _loaded_at) AS order_id_count
     FROM raw_orders
     QUALIFY row_number() OVER (
         PARTITION BY order_id
@@ -30,10 +32,17 @@ WITH latest_raw AS (
         upper(trim(order_status)) AS order_status,
         channel,
         try_cast(delivery_minutes AS INTEGER) AS delivery_minutes,
-        count(*) OVER (PARTITION BY order_id) AS order_id_count
+        order_id_count
     FROM latest_raw
 ), checked AS (
-    SELECT *, round(quantity * unit_price * (1 - discount_pct / 100), 2) AS expected_amount
+    SELECT
+        *,
+        round(quantity * unit_price * (1 - discount_pct / 100), 2) AS expected_amount,
+        -- An order is only finance-safe when its customer, product and store
+        -- passed their own staging checks, matching the ETL inner joins.
+        EXISTS (SELECT 1 FROM stg_customers c WHERE c.customer_id = typed.customer_id AND c.dq_status = 'PASS') AS customer_ok,
+        EXISTS (SELECT 1 FROM stg_products p WHERE p.product_id = typed.product_id AND p.dq_status = 'PASS') AS product_ok,
+        EXISTS (SELECT 1 FROM stg_stores s WHERE s.store_id = typed.store_id AND s.dq_status = 'PASS') AS store_ok
     FROM typed
 )
 SELECT
@@ -46,24 +55,26 @@ SELECT
               AND order_status IN ('DELIVERED', 'CANCELLED', 'RETURNED')
               AND abs(order_amount - expected_amount) <= 0.01
               AND (order_status <> 'DELIVERED' OR delivery_minutes IS NOT NULL)
-              AND order_ts <= current_timestamp
-              AND EXISTS (SELECT 1 FROM raw_customers c WHERE c.customer_id = checked.customer_id)
-              AND EXISTS (SELECT 1 FROM raw_products p WHERE p.product_id = checked.product_id)
-              AND EXISTS (SELECT 1 FROM raw_stores s WHERE s.store_id = checked.store_id)
+              AND coalesce(delivery_minutes, 0) <= 120
+              AND order_ts <= least(CAST(current_timestamp AS TIMESTAMP), TIMESTAMP '2026-10-02 00:00:00')
+              AND customer_ok AND product_ok AND store_ok
          THEN 'PASS' ELSE 'FAIL' END AS dq_status,
     concat_ws('; ',
         CASE WHEN order_id = '' THEN 'Missing order_id' END,
         CASE WHEN order_id_count > 1 THEN 'Duplicate order_id' END,
         CASE WHEN customer_id = '' THEN 'Missing customer_id' END,
-        CASE WHEN NOT EXISTS (SELECT 1 FROM raw_customers c WHERE c.customer_id = checked.customer_id) THEN 'Unknown customer_id' END,
-        CASE WHEN NOT EXISTS (SELECT 1 FROM raw_products p WHERE p.product_id = checked.product_id) THEN 'Unknown product_id' END,
-        CASE WHEN NOT EXISTS (SELECT 1 FROM raw_stores s WHERE s.store_id = checked.store_id) THEN 'Unknown store_id' END,
+        CASE WHEN NOT customer_ok THEN 'Unknown or failed customer_id' END,
+        CASE WHEN NOT product_ok THEN 'Unknown or failed product_id' END,
+        CASE WHEN NOT store_ok THEN 'Unknown or failed store_id' END,
         CASE WHEN quantity <= 0 THEN 'Quantity is not positive' END,
         CASE WHEN discount_pct NOT BETWEEN 0 AND 100 THEN 'Discount outside 0-100' END,
         CASE WHEN payment_mode NOT IN ('UPI', 'Card', 'Cash on Delivery', 'Wallet') THEN 'Invalid payment mode' END,
         CASE WHEN order_status NOT IN ('DELIVERED', 'CANCELLED', 'RETURNED') THEN 'Invalid order status' END,
         CASE WHEN abs(order_amount - expected_amount) > 0.01 THEN 'Amount does not match pricing formula' END,
         CASE WHEN order_status = 'DELIVERED' AND delivery_minutes IS NULL THEN 'Delivered order has no delivery time' END,
-        CASE WHEN order_ts > current_timestamp THEN 'Future-dated order' END
+        CASE WHEN delivery_minutes > 120 THEN 'Delivery time exceeds 120 minutes' END,
+        CASE WHEN order_ts IS NULL THEN 'order_ts is not a valid timestamp' END,
+        -- 2026-10-02 is the end of the latest export day (data_quality.DATA_AS_OF).
+        CASE WHEN order_ts > least(CAST(current_timestamp AS TIMESTAMP), TIMESTAMP '2026-10-02 00:00:00') THEN 'Future-dated order' END
     ) AS failure_reason
 FROM checked;

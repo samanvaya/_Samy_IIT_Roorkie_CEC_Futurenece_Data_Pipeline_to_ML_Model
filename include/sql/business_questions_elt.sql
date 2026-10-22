@@ -4,7 +4,6 @@
 -- QUESTION: q1_daily_revenue_by_zone_store
 SELECT order_date, zone, store_id, daily_net_revenue, delivered_orders
 FROM mart_daily_store_kpis
-WHERE order_date >= '2026-09-01' AND order_date < '2026-10-01'
 ORDER BY order_date, zone, store_id;
 
 -- QUESTION: q2_revenue_margin_by_category
@@ -23,7 +22,6 @@ WITH revenue AS (
     FROM stg_orders
     WHERE dq_status = 'PASS'
       AND order_status = 'DELIVERED'
-      AND order_date >= '2026-09-01' AND order_date < '2026-10-01'
     GROUP BY payment_mode
 ), mismatches AS (
     SELECT COALESCE(order_payment_mode, payment_payment_mode) AS payment_mode,
@@ -47,32 +45,13 @@ ORDER BY total_spend DESC
 LIMIT 10;
 
 -- QUESTION: q6_rejected_rows
-WITH rejected AS (
-    SELECT 'orders.csv' AS file_name, failure_reason, COUNT(*) AS rejected_rows
-    FROM stg_orders
-    WHERE dq_status = 'FAIL' AND failure_reason IS NOT NULL AND failure_reason <> ''
-    GROUP BY failure_reason
-    UNION ALL
-    SELECT 'payments.csv', failure_reason, COUNT(*)
-    FROM stg_payments
-    WHERE dq_status = 'FAIL' AND failure_reason IS NOT NULL AND failure_reason <> ''
-    GROUP BY failure_reason
-    UNION ALL
-    SELECT 'customers.csv', failure_reason, COUNT(*)
-    FROM stg_customers
-    WHERE dq_status = 'FAIL' AND failure_reason IS NOT NULL AND failure_reason <> ''
-    GROUP BY failure_reason
-    UNION ALL
-    SELECT 'products.csv', failure_reason, COUNT(*)
-    FROM stg_products
-    WHERE dq_status = 'FAIL' AND failure_reason IS NOT NULL AND failure_reason <> ''
-    GROUP BY failure_reason
-    UNION ALL
-    SELECT 'stores.csv', failure_reason, COUNT(*)
-    FROM stg_stores
-    WHERE dq_status = 'FAIL' AND failure_reason IS NOT NULL AND failure_reason <> ''
-    GROUP BY failure_reason
-)
-SELECT file_name, failure_reason, rejected_rows
-FROM rejected
+-- Rows rejected by today's run: the latest scorecard in dq_results, one row
+-- per failed rule (a row that breaks two rules is counted under both).
+SELECT split_part(check_name, ':', 1) AS file_name,
+       regexp_replace(check_name, '^[^:]+:[^:]+:', '') AS failure_reason,
+       severity,
+       rows_failed AS rejected_rows
+FROM dq_results
+WHERE run_id = (SELECT run_id FROM dq_results ORDER BY checked_at DESC LIMIT 1)
+  AND rows_failed > 0
 ORDER BY file_name, rejected_rows DESC;

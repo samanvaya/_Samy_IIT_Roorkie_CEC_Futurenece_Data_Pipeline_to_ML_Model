@@ -41,21 +41,9 @@ orders.csv,ORD001326,order_id,Duplicate order_id,Uniqueness,order_id must be uni
 orders.csv,ORD001549,order_id,Duplicate order_id,Uniqueness,order_id must be unique,Critical
 orders.csv,ORD001870,order_id,Duplicate order_id,Uniqueness,order_id must be unique,Critical
 orders.csv,ORD001110,order_id,Duplicate order_id,Uniqueness,order_id must be unique,Critical
-orders.csv,ORD001066,order_status,Invalid order status,Validity,"status must be DELIVERED, CANCELLED or RETURNED",Critical
 orders.csv,ORD000500,order_status,Invalid order status,Validity,"status must be DELIVERED, CANCELLED or RETURNED",Critical
-orders.csv,ORD000153,order_status,Invalid order status,Validity,"status must be DELIVERED, CANCELLED or RETURNED",Critical
 orders.csv,ORD001970,order_status,Invalid order status,Validity,"status must be DELIVERED, CANCELLED or RETURNED",Critical
 orders.csv,ORD001637,order_status,Invalid order status,Validity,"status must be DELIVERED, CANCELLED or RETURNED",Critical
-orders.csv,ORD001812,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD001414,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD000159,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD001364,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD000433,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD002356,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD001640,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD001874,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD000934,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
-orders.csv,ORD000691,payment_mode,Invalid payment mode,Validity,payment mode must use the approved values,Critical
 orders.csv,ORD000469,quantity,Quantity is not positive,Accuracy,quantity must be greater than zero,Critical
 orders.csv,ORD001296,quantity,Quantity is not positive,Accuracy,quantity must be greater than zero,Critical
 orders.csv,ORD001459,quantity,Quantity is not positive,Accuracy,quantity must be greater than zero,Critical
@@ -98,13 +86,22 @@ orders.csv,ORD000455,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy
 orders.csv,ORD001104,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy,delivery_minutes should be at most 120,Critical
 orders.csv,ORD000020,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy,delivery_minutes should be at most 120,Critical
 orders.csv,ORD000424,delivery_minutes,Delivery time exceeds 120 minutes,Accuracy,delivery_minutes should be at most 120,Critical
-orders.csv,ORD002119,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001693,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001089,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001121,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001765,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001965,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
-orders.csv,ORD001725,order_ts,Future-dated order,Timeliness,order_ts must not be in the future,Critical
+orders.csv,ORD002103,discount_pct,Discount outside 0-100,Validity,discount_pct must be between 0 and 100,Critical
+orders.csv,ORD001468,discount_pct,Discount outside 0-100,Validity,discount_pct must be between 0 and 100,Critical
+orders.csv,ORD001237,discount_pct,Discount outside 0-100,Validity,discount_pct must be between 0 and 100,Critical
+orders.csv,ORD000403,order_ts,order_ts is not a valid timestamp,Validity,order_ts must parse as a timestamp,Critical
+orders.csv,ORD001610,order_ts,order_ts is not a valid timestamp,Validity,order_ts must parse as a timestamp,Critical
+orders.csv,ORD000534,order_ts,order_ts is not a valid timestamp,Validity,order_ts must parse as a timestamp,Critical
+orders.csv,ORD000362,order_ts,order_ts is not a valid timestamp,Validity,order_ts must parse as a timestamp,Critical
+orders.csv,ORD002012,order_ts,order_ts is not a valid timestamp,Validity,order_ts must parse as a timestamp,Critical
+orders.csv,ORD000946,order_ts,order_ts is not a valid timestamp,Validity,order_ts must parse as a timestamp,Critical
+orders.csv,ORD002119,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
+orders.csv,ORD001693,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
+orders.csv,ORD001089,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
+orders.csv,ORD001121,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
+orders.csv,ORD001765,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
+orders.csv,ORD001965,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
+orders.csv,ORD001725,order_ts,Future-dated order,Timeliness,order_ts must not be later than the source export (2026-10-01),Critical
 orders.csv,ORD002255,customer_id,Unknown customer_id,Consistency,orders.customer_id must exist in customers,Critical
 orders.csv,ORD000701,customer_id,Unknown customer_id,Consistency,orders.customer_id must exist in customers,Critical
 orders.csv,ORD000997,customer_id,Unknown customer_id,Consistency,orders.customer_id must exist in customers,Critical
@@ -507,6 +504,17 @@ customers.csv,C00357,phone,Phone is not a 10-digit number,Validity,phone should 
 customers.csv,C00130,phone,Phone is not a 10-digit number,Validity,phone should contain exactly 10 digits,Warning
 customers.csv,C00290,phone,Phone is not a 10-digit number,Validity,phone should contain exactly 10 digits,Warning
 customers.csv,C00339,phone,Phone is not a 10-digit number,Validity,phone should contain exactly 10 digits,Warning
+customers.csv,C00199,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00171,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00133,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00032,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00031,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00196,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00136,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00092,loyalty_tier,Loyalty tier casing is not standard,Consistency,"loyalty_tier must be Bronze, Silver, Gold or Platinum (one casing)",Warning
+customers.csv,C00400,signup_date,Future signup_date,Timeliness,signup_date must not be later than the source export,Warning
+customers.csv,C00398,signup_date,Future signup_date,Timeliness,signup_date must not be later than the source export,Warning
+customers.csv,C00038,signup_date,Future signup_date,Timeliness,signup_date must not be later than the source export,Warning
 customers.csv,C00132,pincode,Pincode is not six digits,Validity,pincode should contain exactly 6 digits,Warning
 customers.csv,C00083,pincode,Pincode is not six digits,Validity,pincode should contain exactly 6 digits,Warning
 customers.csv,C00166,pincode,Pincode is not six digits,Validity,pincode should contain exactly 6 digits,Warning
