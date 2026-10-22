@@ -26,10 +26,12 @@ from nammamart_etl import (
     quarantine_critical_rows,
     record_dq_results,
     rejected_order_count,
+    update_customer_history,
     validate_data,
     write_tables,
 )
-from observability import record_pipeline_run
+from alerts import notify_failure, notify_quality_warning
+from observability import VOLUME_CHECK_NAME, record_pipeline_run
 
 DAG_ID = "nammamart_etl_samy"
 
@@ -60,6 +62,8 @@ def _source_data() -> tuple[dict[str, pd.DataFrame], int]:
         "retries": 2,
         "retry_delay": timedelta(minutes=5),
         "execution_timeout": timedelta(minutes=30),
+        # Slack alert (SLACK_WEBHOOK_URL Variable) once a task fails its last retry.
+        "on_failure_callback": notify_failure,
     },
     tags=["nammamart", "etl", "assignment"],
 )
@@ -96,6 +100,8 @@ def nammamart_etl_samy():
             warehouse_path=DEFAULT_WAREHOUSE,
         )
         critical = issues[issues["severity"] == "Critical"]
+        volume_failed = scorecard[(scorecard["check_name"] == VOLUME_CHECK_NAME) & (scorecard["status"] == "FAIL")]
+        notify_quality_warning(DAG_ID, run_id, volume_failed["check_name"].tolist())
         print(f"[Validate] {len(scorecard)} checks, {int((scorecard['status'] == 'FAIL').sum())} failed")
         print(critical.groupby(["file", "problem"]).size().to_string())
         # JSON keeps the small issue log portable through XCom while the
@@ -128,7 +134,20 @@ def nammamart_etl_samy():
         return {"rows_loaded": rows_loaded}
 
     @task
-    def reconcile_payments(_loaded: dict) -> int:
+    def update_customer_history_scd2(_loaded: dict) -> dict:
+        """Apply today's customer snapshot to the SCD Type 2 loyalty-tier history."""
+
+        con = duckdb.connect(str(DEFAULT_WAREHOUSE), read_only=True)
+        try:
+            dim_customer = con.execute("SELECT * FROM etl_dim_customer").fetchdf()
+        finally:
+            con.close()
+        result = update_customer_history(dim_customer, run_id=_run_id(), warehouse_path=DEFAULT_WAREHOUSE)
+        print(f"[SCD2] etl_dim_customer_history: {result}")
+        return result
+
+    @task
+    def reconcile_payments(_history: dict) -> int:
         """Compare clean orders with payments.csv; one row per mismatch."""
 
         con = duckdb.connect(str(DEFAULT_WAREHOUSE), read_only=True)
@@ -172,8 +191,10 @@ def nammamart_etl_samy():
         validation = ti.xcom_pull(task_ids="validate_and_quarantine") or {}
         loaded = ti.xcom_pull(task_ids="transform_and_load") or {}
         reported = ti.xcom_pull(task_ids="report")
-        # report is the last business task: no result means something upstream failed.
-        status = "SUCCESS" if reported is not None else "FAILED"
+        history = ti.xcom_pull(task_ids="update_customer_history_scd2")
+        # report and the history update are the last business tasks: a missing
+        # result means something upstream failed.
+        status = "SUCCESS" if reported is not None and history is not None else "FAILED"
         start = getattr(context.get("dag_run"), "start_date", None) or pendulum.now("UTC")
         record_pipeline_run(
             DEFAULT_WAREHOUSE,
@@ -194,7 +215,9 @@ def nammamart_etl_samy():
     ]
     validation = validate_and_quarantine(extracted)
     loaded = transform_and_load(validation)
-    reported = report(reconcile_payments(loaded))
+    # Sequential, not parallel: DuckDB allows one writing process per file.
+    history = update_customer_history_scd2(loaded)
+    reported = report(reconcile_payments(history))
     audit = audit_completion()
     reported >> audit
 

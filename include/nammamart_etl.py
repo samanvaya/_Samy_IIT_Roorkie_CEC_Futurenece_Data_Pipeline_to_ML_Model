@@ -321,6 +321,60 @@ def write_tables(frames: dict[str, pd.DataFrame], *, warehouse_path: str | Path 
         con.close()
 
 
+HISTORY_TABLE = "etl_dim_customer_history"
+HISTORY_COLUMNS = ["customer_id", "loyalty_tier", "version", "valid_from", "valid_to", "is_current", "run_id"]
+OPEN_VALID_TO = pd.Timestamp("9999-12-31")
+
+
+def update_customer_history(
+    dim_customer: pd.DataFrame,
+    *,
+    run_id: str,
+    effective_at: datetime | None = None,
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+) -> dict[str, int]:
+    """Apply today's customer snapshot to the SCD Type 2 loyalty-tier history.
+
+    A customer whose tier differs from their open version gets that version
+    closed (valid_to = effective_at, is_current = False) and a new version
+    opened; a new customer gets version 1. An unchanged snapshot changes
+    nothing, so reruns and retries are idempotent.
+    """
+
+    effective_at = pd.Timestamp(effective_at or datetime.now(timezone.utc)).tz_localize(None)
+    con = duckdb.connect(str(warehouse_path))
+    try:
+        exists = con.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = ?", [HISTORY_TABLE]
+        ).fetchone()[0]
+        history = con.execute(f'SELECT * FROM "{HISTORY_TABLE}"').fetchdf() if exists else pd.DataFrame(columns=HISTORY_COLUMNS)
+    finally:
+        con.close()
+
+    snapshot = dim_customer[["customer_id", "loyalty_tier"]]
+    current = history[history["is_current"].astype(bool)][["customer_id", "loyalty_tier", "version"]]
+    compared = snapshot.merge(current, on="customer_id", how="left", suffixes=("", "_current"))
+    changes = compared[compared["version"].isna() | (compared["loyalty_tier"] != compared["loyalty_tier_current"])]
+    changed_ids = set(changes.loc[changes["version"].notna(), "customer_id"])
+
+    closing = history["is_current"].astype(bool) & history["customer_id"].isin(changed_ids)
+    history.loc[closing, "valid_to"] = effective_at
+    history.loc[closing, "is_current"] = False
+    opened = pd.DataFrame({
+        "customer_id": changes["customer_id"],
+        "loyalty_tier": changes["loyalty_tier"],
+        "version": changes["version"].fillna(0).astype(int) + 1,
+        "valid_from": effective_at,
+        "valid_to": OPEN_VALID_TO,
+        "is_current": True,
+        "run_id": run_id,
+    })
+    history = pd.concat([history, opened], ignore_index=True) if len(history) else opened
+    history = history.astype({"version": int, "is_current": bool})
+    write_tables({HISTORY_TABLE: history[HISTORY_COLUMNS]}, warehouse_path=warehouse_path)
+    return {"new_customers": int(changes["version"].isna().sum()), "tier_changes": len(changed_ids), "history_rows": len(history)}
+
+
 def record_dq_results(
     dq_results: pd.DataFrame,
     *,
@@ -372,6 +426,7 @@ def run_etl(
     run_id: str | None = None,
     dag_id: str = "nammamart_etl_samy",
     include_increment: bool = False,
+    history_effective_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Run the ETL flow, optionally applying the next-day increment feed."""
 
@@ -393,6 +448,7 @@ def run_etl(
     reports = build_reports(clean_tables["fact_orders"])
     dq_results = pd.concat([dq_results, volume_check(warehouse_path, run_id=run_id, dag_id=dag_id, order_rows=len(data["orders"]), checked_at=str(dq_results["checked_at"].iloc[0]))], ignore_index=True)
     write_warehouse(clean_tables, reconciliation, reports, dq_results, warehouse_path=warehouse_path)
+    history = update_customer_history(clean_tables["dim_customer"], run_id=run_id, effective_at=history_effective_at, warehouse_path=warehouse_path)
     end_time = datetime.now(timezone.utc).isoformat()
     record_pipeline_run(
         warehouse_path,
@@ -418,4 +474,5 @@ def run_etl(
         "reports": reports,
         "increment_inserted": increment_inserted,
         "increment_updated": increment_updated,
+        "customer_history": history,
     }

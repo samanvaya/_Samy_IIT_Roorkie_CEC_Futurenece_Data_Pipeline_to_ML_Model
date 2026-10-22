@@ -192,6 +192,32 @@ def record_dq_results(
     return scorecard
 
 
+HISTORY_SQL_FILE = "dim_customer_history.sql"
+
+
+def update_customer_history(
+    *,
+    run_id: str,
+    effective_at: datetime | None = None,
+    warehouse_path: str | Path = DEFAULT_WAREHOUSE,
+) -> dict[str, int]:
+    """Apply today's stg_customers snapshot to the SCD Type 2 tier history."""
+
+    effective_at = effective_at or datetime.now(timezone.utc)
+    con = duckdb.connect(str(warehouse_path))
+    try:
+        con.execute("SET VARIABLE scd_effective_at = CAST(? AS TIMESTAMP)", [effective_at.replace(tzinfo=None)])
+        con.execute("SET VARIABLE scd_run_id = ?", [run_id])
+        con.execute((SQL_DIR / HISTORY_SQL_FILE).read_text())
+        new, changed = con.execute(
+            "SELECT count(*) FILTER (WHERE current_version IS NULL), count(*) FILTER (WHERE current_version IS NOT NULL) FROM scd_changes"
+        ).fetchone()
+        versions = con.execute("SELECT count(*) FROM dim_customer_history").fetchone()[0]
+    finally:
+        con.close()
+    return {"new_customers": int(new), "tier_changes": int(changed), "history_rows": int(versions)}
+
+
 def _count_current_orders(warehouse_path: str | Path) -> int:
     """Rows in the latest load of each order_id (the rows the checks cover)."""
 
@@ -223,12 +249,14 @@ def run_elt(
     data_dir: str | Path = DATA_DIR,
     warehouse_path: str | Path = DEFAULT_WAREHOUSE,
     run_id: str = "local-elt-run",
+    history_effective_at: datetime | None = None,
 ) -> dict[str, int | str]:
     """Run the raw, staging and mart layers and return table metrics."""
 
     load_raw_tables(data_dir=data_dir, warehouse_path=warehouse_path, run_id=run_id)
     execute_sql_layers(warehouse_path=warehouse_path)
     record_dq_results(run_id=run_id, warehouse_path=warehouse_path)
+    history = update_customer_history(run_id=run_id, effective_at=history_effective_at, warehouse_path=warehouse_path)
     con = duckdb.connect(str(warehouse_path), read_only=True)
     try:
         metrics = {
@@ -239,6 +267,7 @@ def run_elt(
             "mart_store_rows": con.execute("SELECT count(*) FROM mart_daily_store_kpis").fetchone()[0],
             "mart_category_rows": con.execute("SELECT count(*) FROM mart_category_margin").fetchone()[0],
             "reconciliation_rows": con.execute("SELECT count(*) FROM mart_payment_reconciliation").fetchone()[0],
+            "customer_history": history,
         }
     finally:
         con.close()

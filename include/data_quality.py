@@ -287,6 +287,17 @@ def run_quality_checks(
     _check(frame=stores, file_name="stores.csv", row_key="store_id", column="pincode", mask=~stores["pincode"].fillna("").astype(str).str.fullmatch(r"\d{6}"), problem="Pincode is not six digits", dimension="Validity", proposed_rule="pincode should contain exactly 6 digits", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
     _check(frame=stores, file_name="stores.csv", row_key="store_id", column="capacity_orders_per_day", mask=stores["capacity_orders_per_day"] <= 0, problem="Store capacity is not positive", dimension="Accuracy", proposed_rule="capacity must be greater than zero", severity="Critical", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
 
+    # Store capacity (bonus): orders per store per day must not exceed the
+    # store's declared daily capacity. Stores whose capacity is itself invalid
+    # are excluded here because "Store capacity is not positive" flags them.
+    dated = orders[orders["_order_ts"].notna()].assign(order_day=orders["_order_ts"].dt.date)
+    store_days = dated.groupby(["store_id", "order_day"]).size().rename("daily_orders").reset_index()
+    capacity = stores.drop_duplicates("store_id")[["store_id", "capacity_orders_per_day"]]
+    store_days = store_days.merge(capacity, on="store_id", how="inner")
+    store_days = store_days[store_days["capacity_orders_per_day"] > 0].reset_index(drop=True)
+    store_days["store_day"] = store_days["store_id"] + "@" + store_days["order_day"].astype(str)
+    _check(frame=store_days, file_name="stores.csv", row_key="store_day", column="capacity_orders_per_day", mask=store_days["daily_orders"] > store_days["capacity_orders_per_day"], problem="Daily orders exceed store capacity", dimension="Accuracy", proposed_rule="orders per store per day must not exceed capacity_orders_per_day", severity="Warning", run_id=run_id, dag_id=dag_id, checked_at=checked_at, issues=issues, checks=checks)
+
     # The increment feed is checked for the rules that determine whether a
     # corrected or newly arrived order can safely enter the warehouse.
     increment = data["orders_increment"].copy()

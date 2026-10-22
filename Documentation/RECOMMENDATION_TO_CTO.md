@@ -6,7 +6,7 @@ NammaMart should adopt **ELT as the primary warehouse architecture**, with a val
 
 ## Evidence from the completed work
 
-On the September files both pipelines publish identical finance numbers: 1,903 clean orders, ₹932,884.15 delivered net revenue, ₹228,083.65 gross margin and 629 order/payment mismatches. After the 1 October increment both show 2,029 orders (150 inserted, 10 corrected to RETURNED, September revenue down ₹3,579.70). ETL rejects 497 orders before loading and quarantines each with a reason; ELT keeps all 2,412 raw order rows (2,572 after the increment) and marks the same 497 as FAIL in staging. Each run records 37 quality checks, 31 of which fail on this data.
+On the September files both pipelines publish identical finance numbers: 1,903 clean orders, ₹932,884.15 delivered net revenue, ₹228,083.65 gross margin and 629 order/payment mismatches. After the 1 October increment both show 2,029 orders (150 inserted, 10 corrected to RETURNED, September revenue down ₹3,579.70). ETL rejects 497 orders before loading and quarantines each with a reason; ELT keeps all 2,412 raw order rows (2,572 after the increment) and marks the same 497 as FAIL in staging. Each run records 38 quality checks, 31 of which fail on this data.
 
 The most useful observation came from reconciling the two: the first versions disagreed by 467 orders because the Python and SQL copies of the same rules had drifted (ELT silently dropped duplicates; ETL quarantined `upi` instead of standardising it). Two implementations of one rule set will drift again, which is a strong argument for keeping the rules in one place.
 

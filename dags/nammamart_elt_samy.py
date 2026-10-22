@@ -21,8 +21,10 @@ from nammamart_elt import (
     load_raw_tables,
     record_dq_results,
     run_sql_files,
+    update_customer_history,
 )
-from observability import record_pipeline_run
+from alerts import notify_failure, notify_quality_warning
+from observability import VOLUME_CHECK_NAME, record_pipeline_run
 
 DAG_ID = "nammamart_elt_samy"
 
@@ -43,6 +45,8 @@ def _run_id() -> str:
         "retries": 2,
         "retry_delay": timedelta(minutes=5),
         "execution_timeout": timedelta(minutes=30),
+        # Slack alert (SLACK_WEBHOOK_URL Variable) once a task fails its last retry.
+        "on_failure_callback": notify_failure,
     },
     tags=["nammamart", "elt", "assignment"],
 )
@@ -82,7 +86,7 @@ def nammamart_elt_samy():
         return {"rows_loaded": counts.get("PASS", 0), "rows_quarantined": counts.get("FAIL", 0)}
 
     @task
-    def build_marts(_staging: dict) -> None:
+    def build_marts(_history: dict) -> None:
         run_sql_files(MART_SQL_FILES)
         print(f"[Marts] built: {', '.join(name.removesuffix('.sql') for name in MART_SQL_FILES)}")
 
@@ -90,8 +94,17 @@ def nammamart_elt_samy():
     def record_quality(_marts: None) -> int:
         scorecard = record_dq_results(run_id=_run_id(), dag_id=DAG_ID)
         failed = int((scorecard["status"] == "FAIL").sum())
+        volume_failed = scorecard[(scorecard["check_name"] == VOLUME_CHECK_NAME) & (scorecard["status"] == "FAIL")]
+        notify_quality_warning(DAG_ID, _run_id(), volume_failed["check_name"].tolist())
         print(f"[DQ] {len(scorecard)} checks, {failed} failed")
         return failed
+
+    @task
+    def update_customer_history_scd2(_staging: dict) -> dict:
+        # dim_customer_history.sql closes changed tier versions and opens new ones.
+        result = update_customer_history(run_id=_run_id())
+        print(f"[SCD2] dim_customer_history: {result}")
+        return result
 
     @task(trigger_rule="all_done")
     def audit_completion() -> None:
@@ -103,8 +116,10 @@ def nammamart_elt_samy():
         increment = ti.xcom_pull(task_ids="load_increment") or {}
         staging = ti.xcom_pull(task_ids="build_staging") or {}
         quality = ti.xcom_pull(task_ids="record_quality")
-        # record_quality is the last business task: no result means a failure upstream.
-        status = "SUCCESS" if quality is not None else "FAILED"
+        history = ti.xcom_pull(task_ids="update_customer_history_scd2")
+        # record_quality and the history update are the last business tasks:
+        # a missing result means a failure upstream.
+        status = "SUCCESS" if quality is not None and history is not None else "FAILED"
         start = getattr(context.get("dag_run"), "start_date", None) or pendulum.now("UTC")
         record_pipeline_run(
             DEFAULT_WAREHOUSE,
@@ -119,7 +134,9 @@ def nammamart_elt_samy():
         )
         print(f"[Audit] {DAG_ID} run {_run_id()} finished with status {status}")
 
-    quality = record_quality(build_marts(build_staging(load_increment(load_raw()))))
+    # Sequential, not parallel: DuckDB allows one writing process per file.
+    history = update_customer_history_scd2(build_staging(load_increment(load_raw())))
+    quality = record_quality(build_marts(history))
     quality >> audit_completion()
 
 

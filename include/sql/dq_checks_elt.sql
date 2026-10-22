@@ -122,6 +122,12 @@ UNION ALL SELECT 'stores.csv:zone:Missing zone', 'Completeness', 'Critical', cou
 UNION ALL SELECT 'stores.csv:pincode:Pincode is not six digits', 'Validity', 'Warning', count(*),
        count(*) FILTER (WHERE NOT regexp_full_match(pincode, '\d{6}')) FROM s
 UNION ALL SELECT 'stores.csv:capacity_orders_per_day:Store capacity is not positive', 'Accuracy', 'Critical', count(*), count(*) FILTER (WHERE capacity <= 0) FROM s
+UNION ALL SELECT 'stores.csv:capacity_orders_per_day:Daily orders exceed store capacity', 'Accuracy', 'Warning', count(*),
+       count(*) FILTER (WHERE d.daily_orders > s.capacity)
+       FROM (SELECT store_id, CAST(order_ts AS DATE) AS order_day, count(*) AS daily_orders
+             FROM o WHERE order_ts IS NOT NULL GROUP BY 1, 2) d
+       JOIN s ON s.store_id = d.store_id
+       WHERE s.capacity > 0
 -- Next-day increment (rows appended by the incremental load; 0 before it runs)
 UNION ALL SELECT 'orders_2026-10-01_increment.csv:order_amount:Amount does not match pricing formula', 'Accuracy', 'Critical', count(*),
        count(*) FILTER (WHERE abs(try_cast(order_amount AS DECIMAL(12, 2))

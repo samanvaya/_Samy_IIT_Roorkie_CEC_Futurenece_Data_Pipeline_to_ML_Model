@@ -152,8 +152,8 @@ def _missing_file(work_dir: Path) -> list[dict[str, str | int]]:
         elt, elt_error = _capture(lambda: _run_elt(source, work_dir, "exp04"))
         expected = "Both pipelines fail loudly on the missing products file; Airflow retries and marks the source task failed."
         return [
-            _result(4, "ETL", expected, etl_error or str(etl), "Add a source-file preflight check and alert on the failed extract task."),
-            _result(4, "ELT", expected, elt_error or str(elt), "Add the same preflight check before raw loading."),
+            _result(4, "ETL", expected, etl_error or str(etl), "Slack alert on final failure is in place (on_failure_callback); add a source-file preflight check."),
+            _result(4, "ELT", expected, elt_error or str(elt), "Slack alert on final failure is in place; add the same preflight check before raw loading."),
         ]
 
 
@@ -223,8 +223,8 @@ def _volume_anomaly(work_dir: Path) -> list[dict[str, str | int]]:
         elt = run_elt(data_dir=source, warehouse_path=work_dir / "exp07_elt.duckdb", run_id="step10-exp07-elt-small")
         expected = "A greater-than-90% volume drop is detected and reported."
         return [
-            _result(7, "ETL", expected, f"volume check {_latest_check(work_dir / 'exp07_etl.duckdb', VOLUME_CHECK_NAME)}; loaded={etl['rows_loaded']}", "Alert (Slack) when the volume check fails instead of only logging it."),
-            _result(7, "ELT", expected, f"volume check {_latest_check(work_dir / 'exp07_elt.duckdb', VOLUME_CHECK_NAME)}; passing_staging={elt['passing_orders']}", "Alert (Slack) when the volume check fails instead of only logging it."),
+            _result(7, "ETL", expected, f"volume check {_latest_check(work_dir / 'exp07_etl.duckdb', VOLUME_CHECK_NAME)}; loaded={etl['rows_loaded']}", "A Slack warning is now sent when the volume check fails; next, hold mart publication on such a day."),
+            _result(7, "ELT", expected, f"volume check {_latest_check(work_dir / 'exp07_elt.duckdb', VOLUME_CHECK_NAME)}; passing_staging={elt['passing_orders']}", "A Slack warning is now sent when the volume check fails; next, hold mart publication on such a day."),
         ]
 
 
@@ -300,7 +300,7 @@ def write_report(report: pd.DataFrame, output_dir: str | Path = REPO_ROOT / "ass
         + report.to_markdown(index=False)
         + "\n\n## Observability pillars\n\n"
         "- Freshness: covered by the latest-order-age Warning in dq_results; no alert is sent yet.\n"
-        "- Volume: covered by the run-over-run >90% drop check in dq_results; no alert is sent yet.\n"
+        "- Volume: covered by the run-over-run >90% drop check in dq_results, with a Slack warning.\n"
         "- Schema: covered by loud missing-column failures; add a formal contract.\n"
         "- Distribution: partially covered by amount consistency; add baselines by store.\n"
         "- Lineage: strongest because ETL quarantine and ELT raw tables preserve traceability.\n"
