@@ -149,7 +149,7 @@ Issues were found in all five base files. The increment file passed every rule.
 2. Should Warning-level customer issues (bad email/phone format) be loaded masked, or held back until CRM fixes them?
 3. When an order has more than one payment, or a payment for a cancelled order, which payment is authoritative for reconciliation?
 
-(Also confirmed during build: orders tied to a store with missing zone or zero capacity are rejected. These are 311 orders; see [§5.3](#53-business-rule-to-confirm).)
+4. Should an order be rejected when only its store or product record is faulty (e.g. store S07 has no zone)? The pipelines currently reject these 311 orders; my recommendation is to load them under an "Unknown" zone or category instead (see [§5.3](#53-business-rule-to-confirm)).
 
 ---
 
@@ -213,7 +213,27 @@ Each rule now behaves the same in both pipelines. The full analysis is in [Docum
 
 ### 5.3 Business rule to confirm
 
-Both pipelines reject orders whose product or store fails its own Critical checks. Store S07 (no zone) and S12 (zero capacity) alone account for 311 orders. This is the strict, finance-safe interpretation. If Operations prefers to load those orders and only flag the store, the rule must change in both pipelines at once.
+Both pipelines reject orders whose product or store fails its own Critical checks. Store S07 (no zone) and S12 (zero capacity) alone account for 311 orders. This is the strict, finance-safe interpretation, and it is what the submitted pipelines do.
+
+**Recommendation (pending Finance and Operations sign-off): load these orders and flag the store or product record instead.** Industry practice (Kimball's "unknown member" pattern) is to reject a row only when the defect is in the row itself, or when it makes the published number wrong. The 311 orders are real sales that the payment gateway shows as collected. Dropping them because a store record is missing its zone understates revenue and recreates the "doesn't reconcile" problem the client hired us to fix.
+
+| Defect | Affects revenue? | Recommended handling of the order | Severity for the order |
+|---|---|---|---|
+| Store S07 has no zone | No, only zone reporting | Load; report under an "Unknown" zone; raise a ticket with the store-master owner | Warning |
+| Store S12 capacity ≤ 0 | No | Load; the capacity field is unreliable | Warning (store row stays flagged) |
+| Product missing category | No, only category reporting | Load under "Uncategorised" | Warning |
+| Product MRP ≤ 0 or cost > MRP | Revenue no; margin yes | Load the revenue; leave gross margin blank until the catalogue is fixed | Warning (excluded from margin) |
+| Store or product ID not in the master (S00, S17, S99) | Possibly: may be a test or fake order | Keep rejecting, or hold as late-arriving until the master catches up | Critical (unchanged) |
+| Defect in the order itself (amount, duplicate, date, status) | Yes | Reject | Critical (unchanged) |
+
+Why this is the better design:
+
+- **Severity depends on the metric.** The "Critical" label stays on the faulty store or product row; it does not make the customer's order invalid.
+- **Quality becomes visible, not hidden.** An "Unknown zone: ₹X" line tells the COO there is a store-master problem worth fixing. A silently smaller total tells no one anything.
+- **Fixes flow through automatically.** Once the owner corrects the store or product record, the next run places every past order in the right zone or category, with no replay or re-quarantine.
+- **Finance's guarantee still holds.** No invalid order reaches the fact table; only descriptive labels are marked unknown.
+
+Implementation is small: an unknown-member default in `stg_orders.sql` and the mart joins (ELT), and the same fallback in the ETL dimension join. The change must be made in both pipelines together so they stay reconciled ([§5.2](#52-mart-totals-match-etl-totals)).
 
 ---
 
@@ -374,7 +394,7 @@ Dimensions:
 
 | Data | Retention | After that |
 |---|---|---|
-| Raw orders/payments | 8 years (books of account under the Companies Act / GST record-keeping) | Archive to cold storage, then delete |
+| Raw orders/payments | 8 years (books of account under the Companies Act, s.128; GST requires 6) | Archive to cold storage, then delete |
 | Raw customer PII | While the account is active + a short grace period (e.g. 3 years after last order), or until consent is withdrawn (DPDP) | Delete or irreversibly anonymise (drop name/email/phone, keep a pseudonymous ID) |
 | Quarantine files | 90 days after the issue is resolved | Delete (the raw layer keeps the source row) |
 | Masked marts and dimensions | As long as needed for reporting (e.g. 3 years rolling) | Aggregate or delete |
@@ -450,7 +470,7 @@ A FAILED row is demonstrated in [Documentation/step9_observability_test.ipynb](D
 | 6 | Schema change (`order_amount` → `total`) | Fails loudly | ETL: `KeyError: 'order_amount'` in validation. ELT: DuckDB `BinderException` in `stg_orders.sql`. Nothing loaded; no silent wrong data | Task log; failed task in Grid | Add an explicit schema-contract check (expected columns and types) as the first task, with a clear message |
 | 7 | Volume: only 50 orders | > 90% drop detected | Both: volume check **FAIL** (50 vs 2,412 in the previous run); pipeline still loads 42 clean orders | `dq_results` row "Order volume dropped more than 90% vs previous run", task log `[Volume] WARNING` | Alert on this check, and optionally stop publishing marts when it fails |
 | 8 | Drift: `unit_price` × 100 for S10 | A check catches it; mart moves | The amount-formula rule rejects 155 of 157 S10 orders (rejected 497 → 640). In `mart_daily_store_kpis`, S10 revenue falls from ₹73,854.40 to ₹0 (130 delivered orders vanish), so the East zone drops by about 27% | `dq_results`, `stg_orders`, mart | Add per-store distribution baselines (median price/amount vs 30-day history) to catch drift where amounts are consistent too |
-| 9 | Freshness: latest order 30 days old | Timeliness warning | Both: "Latest order older than 1 day" **FAIL** (Warning). 1,911 orders load: shifting every timestamp also "repairs" the 13 invalid/future timestamps | `dq_results` | Alert when this Warning fires on a scheduled run |
+| 9 | Freshness: latest order 30 days old | Timeliness warning | Both: "Latest order older than 1 day" **FAIL** (Warning). 1,911 orders load, 8 more than usual, because overwriting every timestamp also "repairs" rows whose only problem was an invalid or future timestamp | `dq_results` | Alert when this Warning fires on a scheduled run |
 | 10 | Recovery with Clear | Only failed + downstream rerun | After restoring `products.csv` both recover to 1,903 / 629. Airflow: **Clear** on the failed task (with "Downstream") reruns only that task and its dependants; successful extracts keep their green state; `pipeline_runs` keeps the FAILED row and adds a SUCCESS row 📸 | Grid view, task try numbers, `pipeline_runs` | Document the Clear runbook for operators |
 
 **Five pillars:**
@@ -562,7 +582,7 @@ Breakdown of the 629 mismatches by reason (identical in both pipelines):
 | Missing payment for order (clean order with no payment) | 148 | −91,175.40 |
 | Successful payment amount mismatch | 12 | −585.00 |
 
-**Gross amount not reconciling with the gateway: ₹381,390.75** (sum of absolute values). Most of it is money collected against orders that never reached the clean set.
+**Gross amount not reconciling with the gateway: ₹389,302.75** (sum of absolute differences across all 629 rows; the net figure is ₹197,869.95). Most of it is money collected against orders that never reached the clean set.
 
 **Q5. Top 10 customers by spend, with loyalty tier (no raw email/phone)**
 
